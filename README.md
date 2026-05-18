@@ -1,5 +1,6 @@
 # RGW Orphan Cleaner
 
+EXPERIMENTAL, don´t pass `--delete` without manual reviewing.
 A comprehensive script to detect and clean orphaned Ceph RGW metadata and data objects across multisite deployments.
 
 ## Problem
@@ -18,9 +19,11 @@ The script detects four types of orphans:
 | Type | Description | Detection Method |
 |------|-------------|------------------|
 | **Orphan Instances** | Bucket instance metadata without entrypoint | Missing `bucket:name` for `bucket.instance:name:id` |
-| **Stale Instances** | Old bucket instances after resharding | Entrypoint points to different bucket_id |
+| **Stale Instances** | Old bucket instances after resharding | Entrypoint points to different bucket_id (requires `--detect-stale`, see warning below) |
 | **Orphan Index** | Index objects without bucket instance | Missing `.bucket.meta.` for `.dir.<>.*` |
 | **Orphan Data** | Data objects without bucket metadata | Data pool objects with unknown bucket_id prefix |
+
+> **⚠️ Warning about Stale Instances**: Deleting stale instances is **dangerous**. During an active resharding operation, the old bucket instance still exists while data is being copied. Deleting it mid-reshard will **corrupt the bucket and lose data**. The script checks the instance `reshard_status` field (like Ceph does), but stale instances are **excluded from automatic cleanup** unless you explicitly use `--detect-stale --delete-stale --yes-i-really-mean-it`.
 
 ## Requirements
 
@@ -51,11 +54,14 @@ python3 rgw-orphan-cleaner.py --output report.json
 # Interactive cleanup with confirmation
 python3 rgw-orphan-cleaner.py --delete
 
-# Non-interactive cleanup
-python3 rgw-orphan-cleaner.py --delete --yes
+# Non-interactive cleanup (like Ceph admin commands)
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it
 
 # Full cleanup including data objects
-python3 rgw-orphan-cleaner.py --delete --yes --data-pool
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --data-pool
+
+# DANGEROUS: also delete stale instances
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --detect-stale --delete-stale
 ```
 
 ### Safety Options
@@ -66,6 +72,9 @@ python3 rgw-orphan-cleaner.py --inactive-tenants-only
 
 # Verify bucket stats (skip buckets that still respond)
 python3 rgw-orphan-cleaner.py --verify-active
+
+# Detect stale instances from resharding (REQUIRES MANUAL REVIEW, see warning above)
+python3 rgw-orphan-cleaner.py --detect-stale
 
 # Combined safety check
 python3 rgw-orphan-cleaner.py --verify-active --inactive-tenants-only --delete
@@ -93,20 +102,18 @@ The script outputs JSON with the following structure:
     "orphan_index": 11,
     "orphan_data_buckets": 144
   },
-  "orphans": {
-    "instances": [...],
-    "stale_instances": [
-      {
-        "type": "stale_instance",
-        "bucket_name": "ochaze",
-        "bucket_id": "32dac6d0-8eb2-48a1-bd1c-b218005172f7.37737.1",
-        "active_bucket_id": "32dac6d0-8eb2-48a1-bd1c-b218005172f7.50940.2",
-        "oid": ".bucket.meta.ochaze:32...37737.1",
-        "pool": "gva2b.rgw.meta",
-        "namespace": "root",
-        "reason": "entrypoint exists but points to different bucket_id"
-      }
-    ],
+    "orphans": {
+      "instances": [...],
+      "stale_instances": [],
+      "entrypoints": [...],
+      "index": [...],
+      "data": [...]
+    }
+  }
+}
+```
+
+## How It Works
     "entrypoints": [...],
     "index": [...],
     "data": [
@@ -136,18 +143,21 @@ The script outputs JSON with the following structure:
 
 ### Data Detection
 
-1. Lists all objects in data pool via `rados ls`
+1. **Streams** all objects in data pool using `rados ls` with subprocess.Popen (avoids OOM on large clusters)
 2. Extracts bucket_id from object name (`<bucket_id>_<key>`)
 3. Compares against known bucket_ids from metadata
 4. Flags orphaned data bucket IDs
 
 ### Performance
 
-| Cluster Size | Metadata Scan | With Data Pool |
-|-------------|---------------|----------------|
-| Small (<1000 buckets) | < 1s | 1-10s |
-| Medium (1000-100000) | 5-10s | 30-120s |
-| Large (>100000) | 10-30s | 2+ min |
+| Total Objects in Data Pool | Scan Time |
+|---------------------------|-----------|
+| < 1M | 1-10s |
+| 1M - 100M | 30s - 5min |
+| 100M - 1B | 5-30min |
+| > 1B | 1h+ |
+
+> **Note:** The script uses streaming (`subprocess.Popen`) to avoid loading all object names into memory. `rados ls` on 20B+ objects without streaming would OOM.
 
 
 ## Examples
@@ -199,14 +209,30 @@ $ python3 rgw-orphan-cleaner.py --delete --yes --data-pool
 ## Safety
 
 - **Dry run by default**: No objects are deleted unless `--delete` is specified
-- **Confirmation prompt**: Requires user confirmation before deletion
-- **Active bucket detection**: `--verify-active` checks if bucket still responds to stats
-- **Tenant validation**: `--inactive-tenants-only` skips tenants with active users
-- **Two-pass for consistency**: After deleting a stale instance, re-run to clean up index
+- **Confirmation prompt**: Requires user confirmation before deletion (use `--yes-i-really-mean-it` like Ceph admin commands)
+- **Stale instance protection**: Stale instances are NEVER auto-deleted unless both `--detect-stale` and `--delete-stale` are used
+- **Reshard status checking**: When `--detect-stale` is used, the script reads the instance `reshard_status` field like Ceph does, and skips instances that are IN_PROGRESS or IN_LOGRECORD.
+- **Multiple passes required**: Orphans can have dependencies. Deleting an orphan instance may reveal orphaned index objects, and vice versa. Run the script 2-3 times to fully clean up all cascading orphans.
+
+```bash
+# Example: run multiple times until no orphans remain
+$ python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it
+# Found 10 metadata orphan(s)
+... cleanup happens ...
+
+$ python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it
+# Found 3 metadata orphan(s)  (orphan instances revealed orphaned indexes)
+... cleanup happens ...
+
+$ python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it
+# No orphaned metadata or data found.
+```
 
 ## Known Limitations
 
-3. **Versioned buckets**: Script doesn't distinguish current vs. versioned object orphans.
+1. **Versioned buckets**: Script doesn't distinguish current vs. versioned object orphans.
+2. **Stale instances**: The script is conservative with stale instance detection. Use `radosgw-admin reshard stale-instances list` for authoritative results.
+3. **Large clusters**: While streaming prevents OOM, scanning data pools with billions of objects will take hours.
 
 ## Ceph's Built-in Alternatives
 
