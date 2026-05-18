@@ -59,22 +59,35 @@ class RGWZone:
         # derive the base meta pool (e.g. "gva2b.rgw.meta")
         self.meta_pool = self.domain_root.split(":")[0]
 
-        # index pool and data pool from first placement pool entry
+        # index pool and data pool from placement pools
+        # Look for 'default-placement' first, or the non-cache placement
         placement_pools = zone_info.get("placement_pools", {})
         if placement_pools:
+            found_val = None
             if isinstance(placement_pools, dict):
-                first_key = list(placement_pools.keys())[0]
-                val = placement_pools[first_key]
+                # Prefer 'default-placement', fall back to first key
+                if "default-placement" in placement_pools:
+                    found_val = placement_pools["default-placement"]
+                else:
+                    first_key = list(placement_pools.keys())[0]
+                    found_val = placement_pools[first_key]
             elif isinstance(placement_pools, list):
-                val = placement_pools[0]
-                if isinstance(val, dict) and "val" in val:
-                    val = val["val"]
-            else:
-                val = None
-            if val and isinstance(val, dict):
-                self.index_pool = val.get("index_pool")
+                # Prefer element with key='default-placement', fall back to first
+                for entry in placement_pools:
+                    if isinstance(entry, dict) and entry.get("key") == "default-placement":
+                        found_val = entry.get("val")
+                        break
+                if found_val is None and placement_pools:
+                    first_entry = placement_pools[0]
+                    if isinstance(first_entry, dict) and "val" in first_entry:
+                        found_val = first_entry["val"]
+                    elif isinstance(first_entry, dict):
+                        found_val = first_entry
+
+            if found_val and isinstance(found_val, dict):
+                self.index_pool = found_val.get("index_pool")
                 # Get data pool from storage classes
-                storage_classes = val.get("storage_classes", {})
+                storage_classes = found_val.get("storage_classes", {})
                 if storage_classes:
                     first_sc = list(storage_classes.keys())[0]
                     self.data_pool = storage_classes[first_sc].get("data_pool")
@@ -89,11 +102,13 @@ class OrphanDetector:
     """Detects orphaned bucket metadata and data across RADOS pools."""
 
     def __init__(self, zone: RGWZone, verify_active: bool = False,
-                 inactive_tenants_only: bool = False, scan_data_pool: bool = False):
+                 inactive_tenants_only: bool = False, scan_data_pool: bool = False,
+                 detect_stale: bool = False):
         self.zone = zone
         self.verify_active = verify_active
         self.inactive_tenants_only = inactive_tenants_only
         self.scan_data_pool = scan_data_pool
+        self.detect_stale = detect_stale
         self.entrypoints: Dict[str, str] = {}       # bucket_name -> bucket_id
         self.instances: Dict[str, str] = {}         # bucket_id -> bucket_name
         self.index_objects: Dict[str, List[str]] = {}  # bucket_id -> [oid, ...]
@@ -127,22 +142,38 @@ class OrphanDetector:
             sys.exit(1)
         return json.loads(out) if out.strip() else []
 
-    def _rados_ls(self, pool: str, namespace: str = "") -> List[str]:
-        """List objects in a RADOS pool/namespace."""
-        cmd = ["rados", "-p", pool, "ls"]
+    def _rados_ls_streaming(self, pool: str, namespace: str = ""):
+        """Stream objects from a RADOS pool without loading all into memory.
+
+        Uses subprocess.Popen to yield objects one at a time, avoiding OOM
+        on pools with billions of objects.
+        """
+        cmd = ["rados", "-p", pool]
         if namespace:
             cmd += ["-N", namespace]
-        rc, out, err = self._run(cmd)
-        if rc != 0:
-            cmd2 = ["rados", "-p", pool]
-            if namespace:
-                cmd2 += ["-N", namespace]
-            cmd2 += ["ls"]
-            rc, out, err = self._run(cmd2)
-            if rc != 0:
-                print(json.dumps({"error": f"rados ls failed for {pool}/{namespace}: {err.strip()}"}))
-                sys.exit(1)
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        cmd += ["ls"]
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    yield line
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"rados ls failed for {pool}/{namespace}: return code {proc.returncode}"
+                )
+
+    def _rados_ls(self, pool: str, namespace: str = "") -> List[str]:
+        """List objects in a RADOS pool/namespace.
+
+        NOTE: For large pools (data pool), prefer _rados_ls_streaming()
+        to avoid out-of-memory errors.
+        """
+        return list(self._rados_ls_streaming(pool, namespace))
 
     def _parse_instance_oid(self, oid: str) -> Optional[Tuple[str, str, str]]:
         """Parse .bucket.meta OID into (tenant, bucket_name, bucket_id)."""
@@ -179,6 +210,52 @@ class OrphanDetector:
             data = json.loads(out)
             return data.get("data", {}).get("bucket", {}).get("bucket_id")
         except (json.JSONDecodeError, AttributeError):
+            return None
+
+    def _get_instance_reshard_status(self, bucket_id: str, ep_name: str = None) -> Optional[int]:
+        """Read bucket instance metadata to check reshard status.
+
+        Args:
+            bucket_id: the bucket instance id
+            ep_name: entrypoint name (tenant/bucket or bucket), used to build metadata key.
+                     Tenant separator '/' is converted to ':' for the metadata key.
+
+        Returns:
+            0: NOT_RESHARDING
+            1: IN_PROGRESS
+            2: DONE
+            3: IN_LOGRECORD
+            None: error reading instance
+        """
+        # Build bucket.instance key: "tenant:bucket:bucket_id" or "bucket:bucket_id"
+        if ep_name:
+            # ep_name uses '/' to separate tenant, but metadata key uses ':'
+            instance_name = ep_name.replace("/", ":", 1)
+        else:
+            instance_name = self.instances.get(bucket_id, bucket_id)
+
+        instance_key = f"bucket.instance:{instance_name}:{bucket_id}"
+
+        rc, out, err = self._run(
+            ["radosgw-admin", "metadata", "get", instance_key]
+        )
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out)
+            return data.get("data", {}).get("bucket_info", {}).get("reshard_status")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+        try:
+            data = json.loads(out)
+            reshard_status = data.get("data", {}).get("bucket_info", {}).get("reshard_status")
+            if reshard_status is None:
+                print(f"# DEBUG: no reshard_status in metadata for {instance_key}", file=sys.stderr)
+            else:
+                print(f"# DEBUG: reshard_status for {instance_key} = {reshard_status}", file=sys.stderr)
+            return reshard_status
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"# DEBUG: JSON parse error for {instance_key}: {e}", file=sys.stderr)
             return None
 
     def _get_active_tenants(self) -> Set[str]:
@@ -333,13 +410,17 @@ class OrphanDetector:
         # 1f. RADOS: data pool (if requested)
         if self.scan_data_pool and self.zone.data_pool:
             print(f"# Scanning data pool {self.zone.data_pool}...", file=sys.stderr)
-            data_objs = self._rados_ls(self.zone.data_pool)
-            print(f"# Found {len(data_objs)} data objects", file=sys.stderr)
-
-            for oid in data_objs:
-                bucket_id = self._extract_bucket_id_from_data_oid(oid)
-                if bucket_id:
-                    self.data_objects[bucket_id] = self.data_objects.get(bucket_id, 0) + 1
+            count = 0
+            try:
+                for oid in self._rados_ls_streaming(self.zone.data_pool):
+                    count += 1
+                    bucket_id = self._extract_bucket_id_from_data_oid(oid)
+                    if bucket_id:
+                        self.data_objects[bucket_id] = self.data_objects.get(bucket_id, 0) + 1
+            except RuntimeError as e:
+                print(json.dumps({"error": str(e)}))
+                sys.exit(1)
+            print(f"# Processed {count} data objects", file=sys.stderr)
 
     def detect(self) -> Dict:
         """Phase 2: cross-reference and detect all orphans."""
@@ -358,19 +439,110 @@ class OrphanDetector:
             if ep_name in self.rados_entrypoints or ep_name in self.meta_entrypoints:
                 active_id = self.entrypoints.get(ep_name)
                 if active_id and bucket_id != active_id:
-                    stale_instances.append(
-                        {
-                            "type": "stale_instance",
-                            "bucket_name": ep_name,
-                            "bucket_id": bucket_id,
-                            "active_bucket_id": active_id,
-                            "oid": info["oid"],
-                            "pool": self.zone.meta_pool,
-                            "namespace": "root",
-                            "tenant": info["tenant"],
-                            "reason": f"entrypoint exists but points to different bucket_id ({active_id})",
-                        }
-                    )
+                    # entrypoint exists but points to different bucket_id - potential stale instance
+                    if not self.detect_stale:
+                        # Stale instance detection is dangerous (mid-reshard corruption risk).
+                        # Skip but warn user: use --detect-stale to enable (monitored only).
+                        skipped_instances.append(
+                            {
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": "stale instance detection disabled (use --detect-stale). Manual deletion can corrupt active reshards.",
+                            }
+                        )
+                        continue
+
+                    # Check reshard status like Ceph does
+                    reshard_status = self._get_instance_reshard_status(bucket_id, ep_name)
+                    if reshard_status is None:
+                        # Can't read instance - skip safely
+                        skipped_instances.append(
+                            {
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": "could not read instance metadata to verify reshard status",
+                            }
+                        )
+                        continue
+
+                    # Ceph: cls_rgw_reshard_status
+                    # 0=NOT_RESHARDING, 1=IN_PROGRESS, 2=DONE, 3=IN_LOGRECORD
+                    if reshard_status == 1:  # IN_PROGRESS
+                        skipped_instances.append(
+                            {
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": "reshard is IN_PROGRESS - deleting now would corrupt the bucket",
+                            }
+                        )
+                        continue
+
+                    if reshard_status == 3:  # IN_LOGRECORD
+                        skipped_instances.append(
+                            {
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": "reshard is IN_LOGRECORD - background sync may still need this instance",
+                            }
+                        )
+                        continue
+
+                    if reshard_status == 0:  # NOT_RESHARDING
+                        # Different bucket_id but not marked as resharded - suspicious
+                        skipped_instances.append(
+                            {
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": f"entrypoint points to different bucket_id ({active_id}) but instance is NOT_RESHARDING - may be from manual bucket move or corruption",
+                            }
+                        )
+                        continue
+
+                    if reshard_status == 2:  # DONE
+                        # Reshard completed - instance is safe to flag as stale
+                        stale_instances.append(
+                            {
+                                "type": "stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": f"entrypoint exists but points to different bucket_id ({active_id}). Reshard status: DONE.",
+                            }
+                        )
             else:
                 is_safe, reason = self._is_safe_to_remove(info)
                 entry = {
@@ -447,6 +619,7 @@ class OrphanDetector:
                 "verify_active": self.verify_active,
                 "inactive_tenants_only": self.inactive_tenants_only,
                 "scan_data_pool": self.scan_data_pool,
+                "detect_stale": self.detect_stale,
             },
             "summary": {
                 "total_orphans": len(orphan_instances)
@@ -515,54 +688,57 @@ class OrphanCleaner:
             self.failed.append(item)
             return False
 
-    def remove_by_prefix(
-        self, bucket_id: str, pool: str, dry_run: bool = True
-    ) -> Tuple[int, int]:
-        """Remove all data objects matching a bucket_id prefix with progress reporting."""
-        removed_count = 0
-        failed_count = 0
+    def stream_remove_by_prefix(
+        self, bucket_ids: Set[str], pool: str, dry_run: bool = True
+    ) -> Dict[str, Tuple[int, int]]:
+        """Remove all data objects matching any bucket_id prefix in a single pass.
 
-        # List objects matching bucket_id prefix
-        rc, out, err = self._run(["rados", "-p", pool, "ls"])
-        if rc != 0:
-            return 0, 0
+        Streams the pool once, avoiding O(n²) repeated full scans.
+        Returns {bucket_id: (removed_count, failed_count)}.
+        """
+        results: Dict[str, Tuple[int, int]] = {bid: (0, 0) for bid in bucket_ids}
+        total_matched = 0
 
-        objects = [
-            line.strip()
-            for line in out.splitlines()
-            if line.strip().startswith(bucket_id + "_")
-        ]
-        total = len(objects)
+        print(f"# Streaming data pool {pool} for cleanup...", file=sys.stderr)
 
-        if total == 0:
-            return 0, 0
+        try:
+            for oid in self._rados_ls_streaming(pool):
+                for bucket_id in bucket_ids:
+                    if oid.startswith(bucket_id + "_"):
+                        total_matched += 1
+                        if dry_run:
+                            removed, failed = results[bucket_id]
+                            results[bucket_id] = (removed + 1, failed)
+                        else:
+                            rc, _, err = self._run(["rados", "-p", pool, "rm", oid])
+                            removed, failed = results[bucket_id]
+                            if rc == 0:
+                                results[bucket_id] = (removed + 1, failed)
+                            else:
+                                results[bucket_id] = (removed, failed + 1)
+                        # Report progress periodically
+                        if total_matched % 10000 == 0:
+                            total_removed = sum(r[0] for r in results.values())
+                            total_failed = sum(r[1] for r in results.values())
+                            print(
+                                f"#   Progress: {total_matched} objects matched, "
+                                f"removed: {total_removed}, failed: {total_failed}",
+                                file=sys.stderr,
+                            )
+                        break
+        except RuntimeError as e:
+            print(json.dumps({"error": str(e)}))
+            sys.exit(1)
 
-        print(f"#   Found {total} objects to delete for {bucket_id}", file=sys.stderr)
+        total_removed = sum(r[0] for r in results.values())
+        total_failed = sum(r[1] for r in results.values())
+        print(
+            f"#   Done: {total_matched} objects matched, "
+            f"removed: {total_removed}, failed: {total_failed}",
+            file=sys.stderr,
+        )
 
-        for i, oid in enumerate(objects, 1):
-            if dry_run:
-                removed_count += 1
-                if i % 1000 == 0 or i == total:
-                    print(
-                        f"#   Progress: {i}/{total} ({i / total * 100:.1f}%)",
-                        file=sys.stderr,
-                    )
-                continue
-
-            rc, _, err = self._run(["rados", "-p", pool, "rm", oid])
-            if rc == 0:
-                removed_count += 1
-            else:
-                failed_count += 1
-
-            # Report progress every 100 objects or at end
-            if i % 100 == 0 or i == total:
-                print(
-                    f"#   Progress: {i}/{total} ({i / total * 100:.1f}%) - removed: {removed_count}, failed: {failed_count}",
-                    file=sys.stderr,
-                )
-
-        return removed_count, failed_count
+        return results
 
 
 def print_report(report: Dict):
@@ -580,10 +756,10 @@ def main():
         help="Enable deletion mode"
     )
     parser.add_argument(
-        "--yes",
+        "--yes-i-really-mean-it",
         action="store_true",
         default=False,
-        help="Skip interactive confirmation"
+        help="Skip interactive confirmation (like Ceph admin commands)"
     )
     parser.add_argument(
         "--output",
@@ -608,6 +784,18 @@ def main():
         default=False,
         help="Only remove instances for tenants with no active users"
     )
+    parser.add_argument(
+        "--detect-stale",
+        action="store_true",
+        default=False,
+        help="Detect stale bucket instances from resharding. DANGEROUS: can corrupt buckets during active reshards."
+    )
+    parser.add_argument(
+        "--delete-stale",
+        action="store_true",
+        default=False,
+        help="DANGEROUS: Allow deletion of stale instances (use with --yes-i-really-mean-it). Stale instance cleanup can corrupt active buckets during resharding."
+    )
     args = parser.parse_args()
 
     try:
@@ -620,7 +808,8 @@ def main():
         zone,
         verify_active=args.verify_active,
         inactive_tenants_only=args.inactive_tenants_only,
-        scan_data_pool=args.data_pool
+        scan_data_pool=args.data_pool,
+        detect_stale=args.detect_stale,
     )
     detector.discover()
     report = detector.detect()
@@ -652,7 +841,7 @@ def main():
             )
         sys.exit(0)
 
-    if not args.yes:
+    if not args.yes_i_really_mean_it:
         print(
             f"# Found {total} metadata orphan(s) + {total_data} data orphan bucket(s). Proceed? [y/N] ",
             end="",
@@ -669,10 +858,19 @@ def main():
     cleaner = OrphanCleaner(zone)
     all_orphans = (
         report["orphans"]["instances"]
-        + report["orphans"].get("stale_instances", [])
         + report["orphans"]["entrypoints"]
         + report["orphans"]["index"]
     )
+
+    # Include stale instances only if --delete-stale is explicitly requested
+    if args.delete_stale and report["orphans"].get("stale_instances"):
+        stale_count = len(report["orphans"]["stale_instances"])
+        print(
+            f"# WARNING: Including {stale_count} stale instance(s) for deletion. "
+            "This can corrupt active buckets if they are being resharded!",
+            file=sys.stderr,
+        )
+        all_orphans += report["orphans"]["stale_instances"]
 
     if not all_orphans and total_data == 0:
         print("# No orphans to remove.", file=sys.stderr)
@@ -692,23 +890,17 @@ def main():
 
         print(f"# Starting data cleanup: {total_buckets} bucket IDs, ~{total_objects} total objects", file=sys.stderr)
 
-        for idx, data_entry in enumerate(data_orphans, 1):
-            bucket_id = data_entry["bucket_id"]
-            pool = data_entry["pool"]
-            estimated = data_entry["object_count"]
+        # Collect all bucket IDs and do a single streaming pass
+        bucket_ids = set(d["bucket_id"] for d in data_orphans)
+        pool = data_orphans[0]["pool"] if data_orphans else zone.data_pool
+        results = cleaner.stream_remove_by_prefix(bucket_ids, pool, dry_run=False)
 
-            print(f"# [{idx}/{total_buckets}] Processing bucket_id {bucket_id} (~{estimated} objects)...", file=sys.stderr)
-            removed, failed = cleaner.remove_by_prefix(bucket_id, pool, dry_run=False)
+        for data_entry in data_orphans:
+            bucket_id = data_entry["bucket_id"]
+            removed, failed = results.get(bucket_id, (0, 0))
             data_entry["removed_count"] = removed
             data_entry["failed_count"] = failed
-            
-            # Show overall progress
-            if idx < total_buckets:
-                remaining = total_buckets - idx
-                print(f"# Completed {bucket_id}: {removed} removed, {failed} failed ({remaining} bucket IDs remaining)", file=sys.stderr)
-            else:
-                print(f"# Completed {bucket_id}: {removed} removed, {failed} failed (DONE)", file=sys.stderr)
-            print("", file=sys.stderr)
+            print(f"# Completed {bucket_id}: {removed} removed, {failed} failed", file=sys.stderr)
 
     summary = {
         "cleanup_completed": True,
