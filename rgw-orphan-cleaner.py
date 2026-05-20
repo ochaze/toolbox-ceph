@@ -441,8 +441,8 @@ class OrphanDetector:
                 if active_id and bucket_id != active_id:
                     # entrypoint exists but points to different bucket_id - potential stale instance
                     if not self.detect_stale:
-                        # Stale instance detection is dangerous (mid-reshard corruption risk).
-                        # Skip but warn user: use --detect-stale to enable (monitored only).
+                        # Deletion of stale instances is dangerous (mid-reshard corruption risk).
+                        # Skip but warn user: use --detect-stale to delete.
                         skipped_instances.append(
                             {
                                 "type": "skipped_stale_instance",
@@ -666,6 +666,23 @@ class OrphanCleaner:
         proc = subprocess.run(cmd, capture_output=True, text=True)
         return proc.returncode, proc.stdout, proc.stderr
 
+    def _rados_ls_streaming(self, pool: str, namespace: str = ""):
+        proc = subprocess.Popen(
+            ["rados", "-p", pool, "-N", namespace, "ls"]
+            if namespace
+            else ["rados", "-p", pool, "ls"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    yield line
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
     def remove(self, item: Dict, dry_run: bool = True) -> bool:
         oid = item["oid"]
         pool = item["pool"]
@@ -788,7 +805,7 @@ def main():
         "--detect-stale",
         action="store_true",
         default=False,
-        help="Detect stale bucket instances from resharding. DANGEROUS: can corrupt buckets during active reshards."
+        help="Detect stale bucket instances from resharding.",
     )
     parser.add_argument(
         "--delete-stale",
