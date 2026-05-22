@@ -3,6 +3,50 @@
 EXPERIMENTAL, don´t pass `--delete` without manual reviewing.
 A comprehensive script to detect and clean orphaned Ceph RGW metadata and data objects across multisite deployments.
 
+## Ceph RGW Object Structure
+
+```
+┌──────────────────────────────┐
+│   BUCKET (entrypoint)        │
+│   bucket:name                │
+└───────────┬──────────────────┘
+            │
+            ▼
+┌──────────────────────────────┐
+│   INSTANCE (metadata)        │
+│   .bucket.meta.<tenant>:     │
+│   <bucket>:<id>             │
+└───────────┬──────────────────┘
+            │
+            ▼
+┌──────────────────────────────┐
+│   INDEX POOL                 │
+│   .dir.<bucket_id>.shardX    │
+└───────────┬──────────────────┘
+            │
+            ▼
+┌──────────────────────────────┐
+│   DATA POOL                  │
+│   <bucket_id>_<object_key>  │
+└──────────────────────────────┘
+```
+
+### Pool / Namespace Map
+
+| Object Type              | Pool                       | Namespace |
+|--------------------------|----------------------------|-----------|
+| Entrypoints              | `<zone>.rgw.meta`          | `root`    |
+| Instances (.bucket.meta) | `<zone>.rgw.meta`          | `root`    |
+| Index shards (.dir.*)   | `<zone>.rgw.buckets.index` | (empty)   |
+| Data objects             | `<zone>.rgw.buckets.data`  | (empty)   |
+
+### Orphan Detection Logic
+
+1. **Orphan Instance** — `.bucket.meta` exists in `meta:root`, but no corresponding entrypoint in metadata API.
+2. **Stale Instance** — entrypoint exists but points to a different `bucket_id` (reshard), confirmed with `reshard_status == DONE`. Skipped if `IN_PROGRESS` or `IN_LOGRECORD`.
+3. **Orphan Index** — `.dir.` object in index pool, but no instance metadata for that `bucket_id`.
+4. **Orphan Data** — data object in data pool, but no instance metadata for its `bucket_id`.
+
 ## Problem
 
 In Ceph RGW multisite setups, orphaned metadata and data objects can accumulate when:
