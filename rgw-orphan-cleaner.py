@@ -103,16 +103,19 @@ class OrphanDetector:
 
     def __init__(self, zone: RGWZone, verify_active: bool = False,
                  inactive_tenants_only: bool = False, scan_data_pool: bool = False,
-                 detect_stale: bool = False):
+                 start_period: Optional[datetime] = None,
+                 end_period: Optional[datetime] = None):
         self.zone = zone
         self.verify_active = verify_active
         self.inactive_tenants_only = inactive_tenants_only
         self.scan_data_pool = scan_data_pool
-        self.detect_stale = detect_stale
+        self.start_period = start_period
+        self.end_period = end_period
         self.entrypoints: Dict[str, str] = {}       # bucket_name -> bucket_id
         self.instances: Dict[str, str] = {}         # bucket_id -> bucket_name
         self.index_objects: Dict[str, List[str]] = {}  # bucket_id -> [oid, ...]
         self.data_objects: Dict[str, int] = {}      # bucket_id -> count
+        self.data_oid_sample: Dict[str, str] = {}   # bucket_id -> representative oid (for mtime)
 
         # Tracking from metadata API
         self.meta_entrypoints: Set[str] = set()
@@ -174,6 +177,81 @@ class OrphanDetector:
         to avoid out-of-memory errors.
         """
         return list(self._rados_ls_streaming(pool, namespace))
+
+    def _rados_stat(self, pool: str, namespace: str, oid: str) -> Optional[datetime]:
+        """Return the mtime (as a timezone-aware UTC datetime) of a RADOS object, or None."""
+        # Prefer JSON format for reliable parsing (Ceph >=14.x).
+        cmd_json = ["rados", "-p", pool]
+        if namespace:
+            cmd_json += ["-N", namespace]
+        cmd_json += ["stat", "--format=json", oid]
+        rc, out, _ = self._run(cmd_json)
+        if rc == 0 and out.strip():
+            try:
+                data = json.loads(out)
+                mtime = data.get("mtime")
+                if mtime:
+                    # JSON mtime typically looks like "2024-01-15T10:30:00.000000Z"
+                    # Handle ISO 8601 with timezone
+                    mtime = mtime.replace("Z", "+00:00")
+                    return datetime.fromisoformat(mtime)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Fallback: text format (e.g. "mtime: Mon Jan 15 10:30:00 2024")
+        cmd = ["rados", "-p", pool]
+        if namespace:
+            cmd += ["-N", namespace]
+        cmd += ["stat", oid]
+        rc, out, _ = self._run(cmd)
+        if rc != 0:
+            return None
+        for line in out.splitlines():
+            if "mtime" in line:
+                raw = line.split("mtime", 1)[-1].strip().lstrip(":")
+                raw = raw.split(", size")[0].strip()
+                for fmt in (
+                    "%Y-%m-%dT%H:%M:%S.%f%z",
+                    "%Y-%m-%dT%H:%M:%S%z",
+                    "%a %b %d %H:%M:%S %Y",
+                    "%Y-%m-%d %H:%M:%S.%f",
+                    "%Y-%m-%d %H:%M:%S",
+                ):
+                    try:
+                        dt = datetime.strptime(raw, fmt)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt.astimezone(timezone.utc)
+                    except ValueError:
+                        continue
+        return None
+
+    def _is_oid_in_time_period(self, pool: str, namespace: str, oid: str) -> Tuple[bool, Optional[str]]:
+        """Check if a RADOS object's mtime falls within the configured time period.
+
+        Returns (True, None) if the object is within the period.
+        Returns (False, reason_str) if the object is outside the period or mtime could not be determined.
+        """
+        if self.start_period is None and self.end_period is None:
+            return True, None
+        mtime = self._rados_stat(pool, namespace, oid)
+        return self._in_time_period(mtime)
+
+    def _in_time_period(self, dt: Optional[datetime]) -> Tuple[bool, Optional[str]]:
+        """Check if a datetime falls within the configured start/end period.
+
+        Returns (True, None) if the datetime is within the period or no period is configured.
+        Returns (False, reason_str) if the datetime is outside the period or unknown when a period is configured.
+        """
+        if self.start_period is None and self.end_period is None:
+            return True, None
+        if dt is None:
+            return False, "mtime could not be determined, skipping for safety"
+        if self.start_period and dt < self.start_period:
+            return False, "outside specified time period"
+        if self.end_period and dt > self.end_period:
+            return False, "outside specified time period"
+        return True, None
 
     def _parse_instance_oid(self, oid: str) -> Optional[Tuple[str, str, str]]:
         """Parse .bucket.meta OID into (tenant, bucket_name, bucket_id)."""
@@ -417,6 +495,9 @@ class OrphanDetector:
                     bucket_id = self._extract_bucket_id_from_data_oid(oid)
                     if bucket_id:
                         self.data_objects[bucket_id] = self.data_objects.get(bucket_id, 0) + 1
+                        # Keep a sample OID per bucket_id for potential mtime lookup
+                        if bucket_id not in self.data_oid_sample:
+                            self.data_oid_sample[bucket_id] = oid
             except RuntimeError as e:
                 print(json.dumps({"error": str(e)}))
                 sys.exit(1)
@@ -439,26 +520,7 @@ class OrphanDetector:
             if ep_name in self.rados_entrypoints or ep_name in self.meta_entrypoints:
                 active_id = self.entrypoints.get(ep_name)
                 if active_id and bucket_id != active_id:
-                    # entrypoint exists but points to different bucket_id - potential stale instance
-                    if not self.detect_stale:
-                        # Deletion of stale instances is dangerous (mid-reshard corruption risk).
-                        # Skip but warn user: use --detect-stale to delete.
-                        skipped_instances.append(
-                            {
-                                "type": "skipped_stale_instance",
-                                "bucket_name": ep_name,
-                                "bucket_id": bucket_id,
-                                "active_bucket_id": active_id,
-                                "oid": info["oid"],
-                                "pool": self.zone.meta_pool,
-                                "namespace": "root",
-                                "tenant": info["tenant"],
-                                "reason": "stale instance detection disabled (use --detect-stale). Manual deletion can corrupt active reshards.",
-                            }
-                        )
-                        continue
-
-                    # Check reshard status like Ceph does
+                    # entrypoint exists but points to different bucket_id - stale instance
                     reshard_status = self._get_instance_reshard_status(bucket_id, ep_name)
                     if reshard_status is None:
                         # Can't read instance - skip safely
@@ -530,6 +592,20 @@ class OrphanDetector:
 
                     if reshard_status == 2:  # DONE
                         # Reshard completed - instance is safe to flag as stale
+                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                        if not in_period:
+                            skipped_instances.append({
+                                "type": "skipped_stale_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "active_bucket_id": active_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "reason": skip_reason or "outside specified time period",
+                            })
+                            continue
                         stale_instances.append(
                             {
                                 "type": "stale_instance",
@@ -555,18 +631,35 @@ class OrphanDetector:
                     "tenant": info["tenant"],
                     "reason": reason,
                 }
-                if is_safe:
-                    orphan_instances.append(entry)
-                else:
+                if not is_safe:
                     entry["type"] = "skipped_instance"
                     entry["reason"] = f"Safety check failed: {reason}"
                     skipped_instances.append(entry)
+                else:
+                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                    if not in_period:
+                        entry["type"] = "skipped_instance"
+                        entry["reason"] = skip_reason or "outside specified time period"
+                        skipped_instances.append(entry)
+                    else:
+                        orphan_instances.append(entry)
 
         # Entrypoint in RADOS but no instance
         for ep in self.rados_entrypoints:
             if ep not in self.meta_entrypoints:
                 bucket_id = self.entrypoints.get(ep)
                 if not bucket_id or bucket_id not in self.rados_instances:
+                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", ep)
+                    if not in_period:
+                        skipped_instances.append({
+                            "type": "skipped_entrypoint",
+                            "bucket_name": ep,
+                            "oid": ep,
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "reason": skip_reason or "outside specified time period",
+                        })
+                        continue
                     orphan_entrypoints.append(
                         {
                             "type": "orphan_entrypoint",
@@ -585,6 +678,17 @@ class OrphanDetector:
                 and bucket_id not in self.rados_instances
             ):
                 for oid in oids:
+                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.index_pool, "", oid)
+                    if not in_period:
+                        skipped_instances.append({
+                            "type": "skipped_index",
+                            "bucket_id": bucket_id,
+                            "oid": oid,
+                            "pool": self.zone.index_pool,
+                            "namespace": "",
+                            "reason": skip_reason or "outside specified time period",
+                        })
+                        continue
                     orphan_index.append(
                         {
                             "type": "orphan_index",
@@ -600,6 +704,19 @@ class OrphanDetector:
         if self.scan_data_pool:
             for bucket_id, count in self.data_objects.items():
                 if bucket_id not in self.active_bucket_ids:
+                    sample_oid = self.data_oid_sample.get(bucket_id)
+                    if sample_oid:
+                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.data_pool, "", sample_oid)
+                        if not in_period:
+                            skipped_instances.append({
+                                "type": "skipped_data",
+                                "bucket_id": bucket_id,
+                                "object_count": count,
+                                "pool": self.zone.data_pool,
+                                "namespace": "",
+                                "reason": skip_reason or "outside specified time period",
+                            })
+                            continue
                     orphan_data[bucket_id] = {
                         "type": "orphan_data",
                         "bucket_id": bucket_id,
@@ -619,7 +736,11 @@ class OrphanDetector:
                 "verify_active": self.verify_active,
                 "inactive_tenants_only": self.inactive_tenants_only,
                 "scan_data_pool": self.scan_data_pool,
-                "detect_stale": self.detect_stale,
+                "detect_stale": True,
+                "time_period": {
+                    "start_period_utc": self.start_period.isoformat() if self.start_period else None,
+                    "end_period_utc": self.end_period.isoformat() if self.end_period else None,
+                },
             },
             "summary": {
                 "total_orphans": len(orphan_instances)
@@ -802,18 +923,41 @@ def main():
         help="Only remove instances for tenants with no active users"
     )
     parser.add_argument(
-        "--detect-stale",
-        action="store_true",
-        default=False,
-        help="Detect stale bucket instances from resharding.",
-    )
-    parser.add_argument(
         "--delete-stale",
         action="store_true",
         default=False,
-        help="DANGEROUS: Allow deletion of stale instances (use with --yes-i-really-mean-it). Stale instance cleanup can corrupt active buckets during resharding."
+        help="DANGEROUS: Allow deletion of stale bucket instances from resharding. Only delete instances with reshard_status=DONE that are outside any active reshard window. (use with --yes-i-really-mean-it)"
+    )
+    parser.add_argument(
+        "--start-period-utc",
+        type=str,
+        default=None,
+        help="Only include orphans/objects modified on or after this UTC time (ISO 8601, e.g. 2024-01-01T00:00:00Z)"
+    )
+    parser.add_argument(
+        "--end-period-utc",
+        type=str,
+        default=None,
+        help="Only include orphans/objects modified up to this UTC time (ISO 8601, e.g. 2024-12-31T23:59:59Z)"
     )
     args = parser.parse_args()
+
+    # Parse time period arguments
+    start_period: Optional[datetime] = None
+    end_period: Optional[datetime] = None
+    if args.start_period_utc:
+        ts = args.start_period_utc.replace("Z", "+00:00")
+        start_period = datetime.fromisoformat(ts)
+        if start_period.tzinfo is None:
+            start_period = start_period.replace(tzinfo=timezone.utc)
+    if args.end_period_utc:
+        ts = args.end_period_utc.replace("Z", "+00:00")
+        end_period = datetime.fromisoformat(ts)
+        if end_period.tzinfo is None:
+            end_period = end_period.replace(tzinfo=timezone.utc)
+    if start_period and end_period and start_period > end_period:
+        print(json.dumps({"error": "--start-period-utc must be before --end-period-utc"}))
+        sys.exit(1)
 
     try:
         zone = RGWZone()
@@ -826,7 +970,8 @@ def main():
         verify_active=args.verify_active,
         inactive_tenants_only=args.inactive_tenants_only,
         scan_data_pool=args.data_pool,
-        detect_stale=args.detect_stale,
+        start_period=start_period,
+        end_period=end_period,
     )
     detector.discover()
     report = detector.detect()

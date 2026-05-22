@@ -19,11 +19,11 @@ The script detects four types of orphans:
 | Type | Description | Detection Method |
 |------|-------------|------------------|
 | **Orphan Instances** | Bucket instance metadata without entrypoint | Missing `bucket:name` for `bucket.instance:name:id` |
-| **Stale Instances** | Old bucket instances after resharding | Entrypoint points to different bucket_id (requires `--detect-stale`, see warning below) |
+| **Stale Instances** | Old bucket instances after resharding | Entrypoint points to different bucket_id (always detected, deletion requires `--delete-stale`, see warning below) |
 | **Orphan Index** | Index objects without bucket instance | Missing `.bucket.meta.` for `.dir.<>.*` |
 | **Orphan Data** | Data objects without bucket metadata | Data pool objects with unknown bucket_id prefix |
 
-> **⚠️ Warning about Stale Instances**: Deleting stale instances is **dangerous**. During an active resharding operation, the old bucket instance still exists while data is being copied. Deleting it mid-reshard will **corrupt the bucket and lose data**. The script checks the instance `reshard_status` field (like Ceph does), but stale instances are **excluded from automatic cleanup** unless you explicitly use `--detect-stale --delete-stale --yes-i-really-mean-it`.
+> **⚠️ Warning about Stale Instances**: Deleting stale instances is **dangerous**. During an active resharding operation, the old bucket instance still exists while data is being copied. Deleting it mid-reshard will **corrupt the bucket and lose data**. The script checks the instance `reshard_status` field (like Ceph does), but stale instances are **excluded from automatic cleanup** unless you explicitly use `--delete-stale --yes-i-really-mean-it`.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it
 python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --data-pool
 
 # DANGEROUS: also delete stale instances
-python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --detect-stale --delete-stale
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --delete-stale
 ```
 
 ### Safety Options
@@ -73,8 +73,11 @@ python3 rgw-orphan-cleaner.py --inactive-tenants-only
 # Verify bucket stats (skip buckets that still respond)
 python3 rgw-orphan-cleaner.py --verify-active
 
-# Detect stale instances from resharding (REQUIRES MANUAL REVIEW, see warning above)
-python3 rgw-orphan-cleaner.py --detect-stale
+# Only consider orphans/objects from a specific time period
+python3 rgw-orphan-cleaner.py --start-period-utc 2024-01-01T00:00:00Z --end-period-utc 2024-12-31T23:59:59Z
+
+# Objects with mtime that could not be determined are skipped when a time period is set
+python3 rgw-orphan-cleaner.py --end-period-utc 2026-05-22T00:00:00Z
 
 # Combined safety check
 python3 rgw-orphan-cleaner.py --verify-active --inactive-tenants-only --delete
@@ -184,14 +187,14 @@ $ python3 rgw-orphan-cleaner.py
 }
 ```
 
-### Example 2: Find tenant-related false positives
+### Example 2: Time period filtering
 
 ```bash
-# Shows 9400+ orphans but verifies them
-$ python3 rgw-orphan-cleaner.py --verify-active
+# Only consider orphans from a specific time period
+python3 rgw-orphan-cleaner.py --start-period-utc 2024-01-01T00:00:00Z --end-period-utc 2024-12-31T23:59:59Z
 
-# Shows 0 orphans if all buckets are actually active
-$ python3 rgw-orphan-cleaner.py --inactive-tenants-only
+# Combined safety check
+python3 rgw-orphan-cleaner.py --verify-active --inactive-tenants-only --delete
 ```
 
 ### Example 3: Clean everything including data
@@ -210,8 +213,9 @@ $ python3 rgw-orphan-cleaner.py --delete --yes --data-pool
 
 - **Dry run by default**: No objects are deleted unless `--delete` is specified
 - **Confirmation prompt**: Requires user confirmation before deletion (use `--yes-i-really-mean-it` like Ceph admin commands)
-- **Stale instance protection**: Stale instances are NEVER auto-deleted unless both `--detect-stale` and `--delete-stale` are used
-- **Reshard status checking**: When `--detect-stale` is used, the script reads the instance `reshard_status` field like Ceph does, and skips instances that are IN_PROGRESS or IN_LOGRECORD.
+- **Stale instance protection**: Stale instances are NEVER auto-deleted unless `--delete-stale` is used
+- **Reshard status checking**: The script reads the instance `reshard_status` field like Ceph does, and skips instances that are IN_PROGRESS or IN_LOGRECORD.
+- **Time period filtering**: Use `--start-period-utc` and `--end-period-utc` to filter orphans by object mtime. When a time filter is set and an object's mtime cannot be determined, it is conservatively **skipped** (not deleted).
 - **Multiple passes required**: Orphans can have dependencies. Deleting an orphan instance may reveal orphaned index objects, and vice versa. Run the script 2-3 times to fully clean up all cascading orphans.
 
 ```bash
