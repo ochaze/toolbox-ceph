@@ -269,37 +269,57 @@ class SyncRepair:
         }
 
 
-def check_all_buckets(zones: List[str]) -> List[Dict]:
-    """Check all buckets (requires listing all entrypoints). Expensive."""
+def _get_bucket_names() -> List[str]:
     proc = subprocess.run(
         ["radosgw-admin", "metadata", "list", "bucket"],
         capture_output=True, text=True
     )
     if proc.returncode != 0:
-        return [{"error": proc.stderr.strip()}]
-    
+        raise RuntimeError(f"Failed to list buckets: {proc.stderr.strip()}")
     try:
         buckets = json.loads(proc.stdout) if proc.stdout.strip() else []
     except json.JSONDecodeError:
-        return [{"error": "Failed to parse bucket list"}]
+        raise RuntimeError("Failed to parse bucket list from radosgw-admin")
+    if not isinstance(buckets, list):
+        raise RuntimeError("Unexpected bucket list format from radosgw-admin")
+    return buckets
+
+
+def print_ndjson(record: Dict):
+    print(json.dumps(record, separators=(',', ':')))
+
+
+def check_all_buckets(zones: List[str], ndjson: bool = False, progress: bool = True) -> Tuple[List[Dict], int]:
+    """Check all buckets (requires listing all entrypoints). Expensive."""
+    try:
+        buckets = _get_bucket_names()
+    except RuntimeError as e:
+        return [{"error": str(e)}], 0
     
     results = []
     total = len(buckets)
+    issues_count = 0
     for i, bucket in enumerate(buckets):
         repair = SyncRepair(bucket=bucket)
         result = repair.check()
         results.append(result)
-        # Progress to stderr so stdout stays clean for JSON/piping
-        issues = sum(1 for r in results if r.get("status") == "failed")
-        sys.stderr.write(
-            f"\rChecked {i+1:>6}/{total} buckets... {issues} with issues found"
-        )
+        
+        if result.get("status") == "failed":
+            issues_count += 1
+        
+        if ndjson:
+            print_ndjson(result)
+        
+        if progress:
+            progress_text = f"\rChecked {i+1:>6}/{total} buckets... {issues_count} with issues found"
+            sys.stderr.write(progress_text)
+            sys.stderr.flush()
+    
+    if progress:
+        sys.stderr.write("\n")
         sys.stderr.flush()
     
-    sys.stderr.write("\n")
-    sys.stderr.flush()
-    
-    return results
+    return results, issues_count
 
 
 def print_json(data: Dict):
@@ -406,8 +426,14 @@ def main():
     )
     parser.add_argument(
         "--json",
-        action="store_true",
-        help="Output JSON instead of human-readable text",
+        metavar="FILE",
+        help="Output JSON to a file (instead of stdout). When checking all buckets, progress is printed to stdout.",
+    )
+    
+    parser.add_argument(
+        "--ndjson",
+        metavar="FILE",
+        help="Output NDJSON to a file (one JSON line per bucket). When checking all buckets, progress is printed to stdout.",
     )
     
     args = parser.parse_args()
@@ -419,40 +445,64 @@ def main():
     else:
         if not args.bucket:
             parser.error("--bucket is required (or use --check-all)")
-        if not args.check and not args.reset_sync:
+        if not (args.check or args.reset_sync):
             parser.error("Specify --check or --reset-sync")
     
-    # Build output structure
+    use_json = bool(args.json or args.ndjson)
+    json_file = args.json or args.ndjson
+    is_ndjson = bool(args.ndjson)
+    
+    if args.check_all:
+        # Check all buckets — support both grouped JSON and streaming NDJSON
+        if is_ndjson:
+            with open(json_file, 'w') as f:
+                buckets = _get_bucket_names()
+                total = len(buckets)
+                issues_count = 0
+                for i, bucket in enumerate(buckets):
+                    repair = SyncRepair(bucket=bucket)
+                    result = repair.check()
+                    f.write(json.dumps(result, separators=(',', ':')) + '\n')
+                    f.flush()
+                    
+                    if result.get("status") == "failed":
+                        issues_count += 1
+                    
+                    print(f"\rChecked {i+1:>6}/{total} buckets... {issues_count} with issues found", end='', flush=True)
+                print()  # newline after progress
+            print(f"NDJSON written to {json_file}: {total} buckets checked, {issues_count} with issues")
+            sys.exit(1 if issues_count > 0 else 0)
+        else:
+            results, issues_count = check_all_buckets([])
+            output = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mode": "check_all",
+                "buckets_checked": len(results),
+                "buckets_with_issues": issues_count,
+                "results": results,
+            }
+            
+            if use_json:
+                with open(json_file, 'w') as f:
+                    json.dump(output, f, indent=2)
+                print(f"JSON written to {json_file}: {len(results)} buckets checked, {issues_count} with issues")
+            else:
+                print(f"Buckets checked: {len(results)}")
+                print(f"With issues: {issues_count}")
+                for r in results:
+                    if r.get("status") == "failed":
+                        print(f"\n  {r['bucket']}:")
+                        for issue in r.get("issues", []):
+                            print(f"   - {issue['zone_name']}: {issue['type']}")
+                    elif "error" in r:
+                        print(f"\n  {r.get('bucket', '?')}: {r['error']}")
+            
+            sys.exit(1 if issues_count > 0 else 0)
+    
+    # Single bucket mode
     output = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    
-    if args.check_all:
-        # Check all buckets
-        results = check_all_buckets([])
-        output["mode"] = "check_all"
-        output["buckets_checked"] = len(results)
-        output["buckets_with_issues"] = sum(
-            1 for r in results if r.get("status") == "failed"
-        )
-        output["results"] = results
-        
-        if args.json:
-            print_json(output)
-        else:
-            print(f"Buckets checked: {output['buckets_checked']}")
-            print(f"With issues: {output['buckets_with_issues']}")
-            for r in results:
-                if r.get("status") == "failed":
-                    print(f"\n❌ {r['bucket']}:")
-                    for issue in r.get("issues", []):
-                        print(f"   - {issue['zone_name']}: {issue['type']}")
-                elif "error" in r:
-                    print(f"\n⚠️  {r.get('bucket', '?')}: {r['error']}")
-        
-        sys.exit(1 if output["buckets_with_issues"] > 0 else 0)
-    
-    # Single bucket mode
     repair = SyncRepair(
         bucket=args.bucket,
         source_zone=args.source_zone,
@@ -462,8 +512,14 @@ def main():
         result = repair.check()
         output.update(result)
         
-        if args.json:
-            print_json(output)
+        if use_json:
+            if is_ndjson:
+                out_text = json.dumps(output, separators=(',', ':')) + '\n'
+            else:
+                out_text = json.dumps(output, indent=2) + '\n'
+            with open(json_file, 'w') as f:
+                f.write(out_text)
+            print(f"Result written to {json_file}")
         else:
             print_human(result, check_mode=True)
         
@@ -473,8 +529,14 @@ def main():
         result = repair.fix()
         output.update(result)
         
-        if args.json:
-            print_json(output)
+        if use_json:
+            if is_ndjson:
+                out_text = json.dumps(output, separators=(',', ':')) + '\n'
+            else:
+                out_text = json.dumps(output, indent=2) + '\n'
+            with open(json_file, 'w') as f:
+                f.write(out_text)
+            print(f"Result written to {json_file}")
         else:
             print_human(result, check_mode=False)
         
