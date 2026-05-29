@@ -324,17 +324,6 @@ class OrphanDetector:
             return data.get("data", {}).get("bucket_info", {}).get("reshard_status")
         except (json.JSONDecodeError, AttributeError):
             return None
-        try:
-            data = json.loads(out)
-            reshard_status = data.get("data", {}).get("bucket_info", {}).get("reshard_status")
-            if reshard_status is None:
-                print(f"# DEBUG: no reshard_status in metadata for {instance_key}", file=sys.stderr)
-            else:
-                print(f"# DEBUG: reshard_status for {instance_key} = {reshard_status}", file=sys.stderr)
-            return reshard_status
-        except (json.JSONDecodeError, AttributeError) as e:
-            print(f"# DEBUG: JSON parse error for {instance_key}: {e}", file=sys.stderr)
-            return None
 
     def _get_active_tenants(self) -> Set[str]:
         if self._active_tenants is not None:
