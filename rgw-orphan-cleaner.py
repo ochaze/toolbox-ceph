@@ -574,9 +574,12 @@ class OrphanDetector:
                         continue
 
                     if reshard_status == 0:  # NOT_RESHARDING
-                        # Different bucket_id but not marked as resharded - suspicious
-                        skipped_instances.append(
-                            {
+                        # Default state for buckets. Old instances may be abandoned
+                        # after delete/recreate cycles (e.g. S3 replication changes).
+                        # Safe to delete if entrypoint no longer references this bucket_id.
+                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                        if not in_period:
+                            skipped_instances.append({
                                 "type": "skipped_stale_instance",
                                 "bucket_name": ep_name,
                                 "bucket_id": bucket_id,
@@ -585,9 +588,18 @@ class OrphanDetector:
                                 "pool": self.zone.meta_pool,
                                 "namespace": "root",
                                 "tenant": info["tenant"],
-                                "reason": f"entrypoint points to different bucket_id ({active_id}) but instance is NOT_RESHARDING - may be from manual bucket move or corruption",
-                            }
-                        )
+                                "reason": skip_reason,
+                            })
+                            continue
+                        stale_instances.append({
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "active_bucket_id": active_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                        })
                         continue
 
                     if reshard_status == 2:  # DONE
@@ -1042,7 +1054,7 @@ def main():
     for item in all_orphans:
         ok = cleaner.remove(item, dry_run=False)
         status = "removed" if ok else "FAILED"
-        print(f"# {status}: {item['type']} {item['oid']}", file=sys.stderr)
+        print(f"# {status}: {item.get('type', item.get('bucket_id', 'unknown'))} {item['oid']}", file=sys.stderr)
 
     # Clean data orphans
     if args.data_pool and total_data > 0:
