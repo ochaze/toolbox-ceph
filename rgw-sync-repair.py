@@ -284,9 +284,20 @@ def check_all_buckets(zones: List[str]) -> List[Dict]:
         return [{"error": "Failed to parse bucket list"}]
     
     results = []
-    for bucket in buckets:
+    total = len(buckets)
+    for i, bucket in enumerate(buckets):
         repair = SyncRepair(bucket=bucket)
-        results.append(repair.check())
+        result = repair.check()
+        results.append(result)
+        # Progress to stderr so stdout stays clean for JSON/piping
+        issues = sum(1 for r in results if r.get("status") == "failed")
+        sys.stderr.write(
+            f"\rChecked {i+1:>6}/{total} buckets... {issues} with issues found"
+        )
+        sys.stderr.flush()
+    
+    sys.stderr.write("\n")
+    sys.stderr.flush()
     
     return results
 
