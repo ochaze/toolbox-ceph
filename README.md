@@ -2,6 +2,8 @@
 
 **EXPERIMENTAL** — don't pass `--delete` without manual reviewing.
 
+> **Ceph Version:** Verified against Ceph v21.0.0 (development/main, commit `906dba604de`). Also valid for Ceph v20.x (Squid) — the documented structures (`RGWBucketEntryPoint`, `RGWBucketInfo`, `rgw_bucket_dir_entry`) are compatible, including `cksum_type` and `sync_policy_info` fields which were introduced in v20.
+
 Tools for maintaining healthy Ceph RGW multisite deployments.
 
 ## Table of Contents
@@ -81,6 +83,78 @@ A comprehensive script to detect and clean orphaned Ceph RGW metadata and data o
 │   <bucket_id>_<object_key>  │
 └──────────────────────────────┘
 ```
+
+**Structure Details:**
+
+1. RGWBucketEntryPoint (entrypoint) at src/rgw/rgw_common.h:1170 contains:
+   - rgw_bucket bucket - the bucket identifier
+   - rgw_owner owner - who owns the bucket
+   - ceph::real_time creation_time - when it was created
+   - bool linked - whether it's linked to a user
+   - bool has_bucket_info - backward compatibility flag
+   - RGWBucketInfo old_bucket_info - for old format compatibility
+
+2. RGWBucketInfo (instance metadata) at src/rgw/rgw_common.h:1094 contains:
+   - rgw_bucket bucket - bucket identifier
+   - rgw_owner owner - owner
+   - uint32_t flags - various flags (versioned, MFA, etc.)
+   - std::string zonegroup - which zonegroup the bucket belongs to
+   - ceph::real_time creation_time - creation timestamp
+   - rgw_placement_rule placement_rule - where data is stored
+   - bool has_instance_obj - whether instance object exists
+   - RGWObjVersionTracker objv_tracker - version tracking
+   - RGWQuotaInfo quota - bucket quota settings
+   - rgw::BucketLayout layout - bucket index layout (sharding info)
+   - bool requester_pays - AWS requester pays setting
+   - bool has_website + RGWBucketWebsiteConf website_conf - static website config
+   - bool swift_versioning + swift_ver_location - Swift versioning
+   - std::map<std::string, uint32_t> mdsearch_config - metadata search config
+   - rgw::cksum::Type cksum_type - checksum type
+   - cls_rgw_reshard_status reshard_status + new_bucket_instance_id - resharding state
+   - RGWObjectLock obj_lock - object lock (WORM) configuration
+   - std::optional<rgw_sync_policy_info> sync_policy - multisite sync policy
+
+
+3. INDEX POOL
+
+Storage:
+- Pool name: from zone_params.placement_pools[index_pool] or explicit placement
+- Objects named: .dir.<bucket_id>.shardX (X = shard number)
+
+Contents:
+Each shard contains rgw_bucket_dir_entry records (src/cls/rgw/cls_rgw_types.h:373) per object:
+- Key: Object name + instance (for versioning)
+- Version: Epoch number
+- Locator: RADOS locator string
+- Flags: VERSIONED, CURRENT, DELETE_MARKER, COMMON_PREFIX
+- Metadata (rgw_bucket_dir_entry_meta):
+- Size, mtime, etag
+- Owner / owner_display_name
+- Content-type
+- Storage class (STANDARD, etc.)
+- Accounted size (post-compression/encryption)
+- Appendable flag
+- Pending map: Uncommitted operations
+
+Purpose: Bucket listing, object existence checks, versioning state, listing with delimiters.
+
+4. DATA POOL
+
+Storage:
+- Pool name: from placement_rule → storage_class.data_pool (e.g., default.rgw.data)
+- Objects: RADOS objects containing actual user data
+
+Object naming:
+- Physical RADOS object name derived from rgw_obj → rgw_raw_obj
+- Format involves bucket placement + object key hash
+- Example pattern: <bucket_id>_<object_key_hash> or from manifest locations
+
+Contents:
+- Raw object data and metadata
+- For multipart uploads: multiple RADOS objects (manifest tracks locations)
+- Each rgw_raw_obj specifies exact pool + object ID (src/rgw/rgw_common.h)
+
+Purpose: Stores actual object bytes, accessed directly via librados after index lookup resolves the location.
 
 ### Pool / Namespace Map
 
