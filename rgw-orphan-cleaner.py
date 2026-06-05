@@ -3,7 +3,10 @@
 RGW Complete Orphan Cleaner
 
 Detects and optionally cleans:
-  - Orphan bucket instance metadata (instance without entrypoint)
+  - Orphan bucket instance metadata (instance without entrypoint, flags=0)
+    → Race condition: entrypoint removed but BUCKET_DELETED never set. Requires manual cleanup.
+  - Transient bucket instance metadata (instance without entrypoint, flags=BUCKET_DELETED=64)
+    → BucketTrimInstanceCR will clean these up automatically. Optionally force-cleanup with --include-transient.
   - Stale instances from resharding (entrypoint points elsewhere)
   - Orphan bucket index objects (index without known instance)
   - Orphan data objects (data without known bucket instance)
@@ -325,6 +328,35 @@ class OrphanDetector:
         except (json.JSONDecodeError, AttributeError):
             return None
 
+    def _get_instance_flags(self, bucket_id: str, ep_name: str = None) -> Optional[int]:
+        """Read bucket instance metadata to check bucket_info flags.
+
+        Args:
+            bucket_id: the bucket instance id
+            ep_name: entrypoint name (tenant/bucket or bucket), used to build metadata key.
+                     Tenant separator '/' is converted to ':' for the metadata key.
+
+        Returns:
+            The flags integer value (e.g. 0, 64=BUCKET_DELETED), or None on error.
+        """
+        if ep_name:
+            instance_name = ep_name.replace("/", ":", 1)
+        else:
+            instance_name = self.instances.get(bucket_id, bucket_id)
+
+        instance_key = f"bucket.instance:{instance_name}:{bucket_id}"
+
+        rc, out, err = self._run(
+            ["radosgw-admin", "metadata", "get", instance_key]
+        )
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out)
+            return data.get("data", {}).get("bucket_info", {}).get("flags")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
     def _get_active_tenants(self) -> Set[str]:
         if self._active_tenants is not None:
             return self._active_tenants
@@ -496,6 +528,7 @@ class OrphanDetector:
         """Phase 2: cross-reference and detect all orphans."""
 
         orphan_instances = []
+        transient_instances = []
         stale_instances = []
         skipped_instances = []
         orphan_entrypoints = []
@@ -622,28 +655,74 @@ class OrphanDetector:
                         )
             else:
                 is_safe, reason = self._is_safe_to_remove(info)
-                entry = {
-                    "type": "orphan_instance",
-                    "bucket_name": ep_name,
-                    "bucket_id": bucket_id,
-                    "oid": info["oid"],
-                    "pool": self.zone.meta_pool,
-                    "namespace": "root",
-                    "tenant": info["tenant"],
-                    "reason": reason,
-                }
                 if not is_safe:
-                    entry["type"] = "skipped_instance"
-                    entry["reason"] = f"Safety check failed: {reason}"
+                    entry = {
+                        "type": "skipped_instance",
+                        "bucket_name": ep_name,
+                        "bucket_id": bucket_id,
+                        "oid": info["oid"],
+                        "pool": self.zone.meta_pool,
+                        "namespace": "root",
+                        "tenant": info["tenant"],
+                        "reason": f"Safety check failed: {reason}",
+                    }
                     skipped_instances.append(entry)
                 else:
                     in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
                     if not in_period:
-                        entry["type"] = "skipped_instance"
-                        entry["reason"] = skip_reason or "outside specified time period"
+                        entry = {
+                            "type": "skipped_instance",
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                            "reason": skip_reason or "outside specified time period",
+                        }
                         skipped_instances.append(entry)
                     else:
-                        orphan_instances.append(entry)
+                        # Check flags to differentiate true orphans from transient
+                        flags = self._get_instance_flags(bucket_id, ep_name)
+                        if flags == 64:
+                            # BUCKET_DELETED - BucketTrimInstanceCR will clean this up
+                            transient_instances.append({
+                                "type": "transient_instance_marked",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "flags": flags,
+                                "reason": "BucketTrimInstanceCR will clean this up (flags=BUCKET_DELETED)",
+                            })
+                        elif flags == 0:
+                            # Race condition: entrypoint removed but flags never set
+                            orphan_instances.append({
+                                "type": "orphan_instance_race",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "flags": flags,
+                                "reason": "Race condition: entrypoint removed but flags=0 (BUCKET_DELETED never set)",
+                            })
+                        else:
+                            # Unknown or unexpected flags value
+                            orphan_instances.append({
+                                "type": "orphan_instance",
+                                "bucket_name": ep_name,
+                                "bucket_id": bucket_id,
+                                "oid": info["oid"],
+                                "pool": self.zone.meta_pool,
+                                "namespace": "root",
+                                "tenant": info["tenant"],
+                                "flags": flags,
+                                "reason": f"Unexpected flags value ({flags}) on orphan instance",
+                            })
 
         # Entrypoint in RADOS but no instance
         for ep in self.rados_entrypoints:
@@ -748,11 +827,13 @@ class OrphanDetector:
                 + len(stale_instances)
                 + len(orphan_entrypoints)
                 + len(orphan_index),
+                "total_transient_instances": len(transient_instances),
                 "total_data_orphans": len(orphan_data),
                 "total_data_orphan_objects": sum(
                     d["object_count"] for d in orphan_data.values()
                 ),
                 "orphan_instances": len(orphan_instances),
+                "transient_instances": len(transient_instances),
                 "stale_instances": len(stale_instances),
                 "skipped_instances": len(skipped_instances),
                 "orphan_entrypoints": len(orphan_entrypoints),
@@ -767,6 +848,7 @@ class OrphanDetector:
             },
             "orphans": {
                 "instances": orphan_instances,
+                "transient_instances": transient_instances,
                 "stale_instances": stale_instances,
                 "entrypoints": orphan_entrypoints,
                 "index": orphan_index,
@@ -930,6 +1012,12 @@ def main():
         help="DANGEROUS: Allow deletion of stale bucket instances from resharding. Only delete instances with reshard_status=DONE that are outside any active reshard window. (use with --yes-i-really-mean-it)"
     )
     parser.add_argument(
+        "--include-transient",
+        action="store_true",
+        default=False,
+        help="Include transient instances (flags=BUCKET_DELETED) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
+    )
+    parser.add_argument(
         "--start-period-utc",
         type=str,
         default=None,
@@ -986,8 +1074,9 @@ def main():
 
     total = report["summary"]["total_orphans"]
     total_data = report["summary"]["total_data_orphans"]
+    total_transient = report["summary"]["total_transient_instances"]
 
-    if total == 0 and total_data == 0:
+    if total == 0 and total_data == 0 and total_transient == 0:
         print("# No orphaned metadata or data found.", file=sys.stderr)
         sys.exit(0)
 
@@ -996,6 +1085,12 @@ def main():
             f"# Found {total} metadata orphan(s). Use --delete to clean up.",
             file=sys.stderr,
         )
+        if total_transient > 0:
+            print(
+                f"# Found {total_transient} transient instance(s) (flags=BUCKET_DELETED). "
+                "These will be cleaned up by BucketTrimInstanceCR. Use --delete --include-transient to force cleanup.",
+                file=sys.stderr,
+            )
         if total_data > 0:
             total_data_objs = report["summary"]["total_data_orphan_objects"]
             print(
@@ -1005,8 +1100,11 @@ def main():
         sys.exit(0)
 
     if not args.yes_i_really_mean_it:
+        transient_msg = ""
+        if total_transient > 0:
+            transient_msg = f" + {total_transient} transient instance(s)"
         print(
-            f"# Found {total} metadata orphan(s) + {total_data} data orphan bucket(s). Proceed? [y/N] ",
+            f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s). Proceed? [y/N] ",
             end="",
             file=sys.stderr,
         )
@@ -1025,6 +1123,16 @@ def main():
         + report["orphans"]["index"]
     )
 
+    # Include transient instances only if --include-transient is explicitly requested
+    if args.include_transient and report["orphans"].get("transient_instances"):
+        transient_count = len(report["orphans"]["transient_instances"])
+        print(
+            f"# INFO: Including {transient_count} transient instance(s) for deletion. "
+            "Normally these are cleaned up by BucketTrimInstanceCR.",
+            file=sys.stderr,
+        )
+        all_orphans += report["orphans"]["transient_instances"]
+
     # Include stale instances only if --delete-stale is explicitly requested
     if args.delete_stale and report["orphans"].get("stale_instances"):
         stale_count = len(report["orphans"]["stale_instances"])
@@ -1036,7 +1144,14 @@ def main():
         all_orphans += report["orphans"]["stale_instances"]
 
     if not all_orphans and total_data == 0:
-        print("# No orphans to remove.", file=sys.stderr)
+        if total_transient > 0 and not args.include_transient:
+            print(
+                f"# No true orphans to remove ({total_transient} transient instance(s) skipped, "
+                "use --include-transient to clean them up).",
+                file=sys.stderr,
+            )
+        else:
+            print("# No orphans to remove.", file=sys.stderr)
         sys.exit(0)
 
     # Clean metadata orphans
