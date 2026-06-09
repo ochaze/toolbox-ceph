@@ -10,8 +10,8 @@ Tools for maintaining healthy Ceph RGW multisite deployments.
 
 **Scripts in this repository:**
 
-1. **[`rgw-orphan-cleaner.py`](#rgw-orphan-cleanerpy)** — Cleans orphaned metadata/data in multisite RGW
-2. **[`rgw-sync-gc.py`](#rgw-sync-gcpy)** — Cleans stale sync-status objects in the log pool
+1. **[`rgw-orphan-cleaner.py`](#rgw-orphan-cleanerpy)** — Cleans orphaned metadata/data in multisite RGW, now including stale sync log entries
+2. **[`rgw-sync-gc.py`](#rgw-sync-gcpy)** — Dedicated sync log cleaner (standalone, logs only)
 3. **[`rgw-sync-repair.py`](#rgw-sync-repairpy)** — Resets stuck per-bucket sync markers after replication changes
 
 ---
@@ -176,6 +176,22 @@ Purpose: Stores actual object bytes, accessed directly via librados after index 
 3. **Orphan Index** — `.dir.` object in index pool, but no instance metadata for that `bucket_id`.
 4. **Orphan Data** — data object in data pool, but no instance metadata for its `bucket_id`.
 
+### Stale Sync Log Detection
+
+Sync log entries (in `<zone>.rgw.log`) are considered **stale** only when **both** of the following are true:
+
+- The **`bucket_id`** referenced in the sync log OID is **absent** from all known `bucket.instance` metadata
+- The **`bucket_name`** referenced in the sync log OID is **absent** from all known entrypoints (`bucket:` metadata and RADOS `root` namespace)
+
+This cross-reference approach is **safe for buckets that were deleted and recreated with the same name** — because while the old `bucket_id` is gone, the recreated bucket has a new entrypoint, so the sync log entry is **not** flagged as stale.
+
+**Usage:**
+- Detection is automatic (checked on every run)
+- Deletion requires both `--delete` and `--delete-sync-logs`
+- Only sync log entries that pass the safety check are deleted
+
+> **Note:** Sync logs are cleaned **after** the metadata cleanup is complete, but still subject to the same confirmation prompt (`--yes-i-really-mean-it` or interactive prompt).
+
 ## Problem
 
 In Ceph RGW multisite setups, orphaned metadata and data objects can accumulate when:
@@ -194,7 +210,7 @@ The script detects four types of orphans:
 | **Stale Instances** | Old bucket instances after resharding | Entrypoint points to different bucket_id (always detected, deletion requires `--delete-stale`, see warning below) |
 | **Orphan Index** | Index objects without bucket instance | Missing `.bucket.meta.` for `.dir.<>.*` |
 | **Orphan Data** | Data objects without bucket metadata | Data pool objects with unknown bucket_id prefix |
-
+| **Stale Sync Logs** | Sync status entries for deleted buckets | `bucket.sync-status.*` / `bucket.full-sync-status.*` referencing buckets with no entrypoint or instance |
 > **⚠️ Warning about Stale Instances**: Deleting stale instances is **dangerous**. During an active resharding operation, the old bucket instance still exists while data is being copied. Deleting it mid-reshard will **corrupt the bucket and lose data**. The script checks the instance `reshard_status` field (like Ceph does), but stale instances are **excluded from automatic cleanup** unless you explicitly use `--delete-stale --yes-i-really-mean-it`.
 
 ## Requirements
@@ -284,7 +300,19 @@ The script outputs JSON with the following structure:
     "index": [...],
     "data": [...]
   },
-  "skipped": [...]
+  "skipped": [...],
+  "sync_logs": {
+    "log_pool": "gva2b.rgw.log",
+    "total_entries": 15738,
+    "deleted": false,
+    "removed_count": 0,
+    "failed_count": 0,
+    "sample_oids": [
+      "bucket.sync-status.zone:tenant/bucket:bucket_id:shard",
+      "bucket.full-sync-status.zone:tenant/bucket:bucket_id"
+    ],
+    "entries": []
+  }
 }
 ```
 
@@ -299,6 +327,17 @@ The script outputs JSON with the following structure:
    - **Orphan instances**: Instance without entrypoint
    - **Stale instances**: Entrypoint points to different bucket_id (reshard)
    - **Orphan index**: Index without instance
+
+### Sync Log Detection
+
+1. Parses each `bucket.sync-status.*` / `bucket.full-sync-status.*` OID in the log pool to extract:
+   - `bucket_id` from the OID (e.g., `32dac6d0-...90476.8`)
+   - `bucket_name` from the OID (e.g., `bucket1`)
+2. Cross-references against live metadata:
+   - **id in known_instances?** → bucket instance still exists → **NOT stale**
+   - **name in known_entrypoints?** → bucket entrypoint still exists → **NOT stale**
+3. Only flags as stale when **both** checks fail
+4. If `--delete --delete-sync-logs`, removes stale entries via `rados rm`
 
 ### Data Detection
 
@@ -370,6 +409,9 @@ $ python3 rgw-orphan-cleaner.py --delete --yes --data-pool
 - **Confirmation prompt**: Requires user confirmation before deletion (use `--yes-i-really-mean-it` like Ceph admin commands)
 - **Stale instance protection**: Stale instances are NEVER auto-deleted unless `--delete-stale` is used
 - **Reshard status checking**: The script reads the instance `reshard_status` field like Ceph does. Safe to delete: `DONE` (reshard complete) and `NOT_RESHARDING` (old instances abandoned by delete/recreate). **Never deleted**: `IN_PROGRESS` or `IN_LOGRECORD` (active reshard).
+- **Sync log safety**: Sync log entries are only flagged as stale when **both** the referenced `bucket_id` instance AND the referenced `bucket_name` entrypoint are confirmed absent. This prevents false positives on:
+  - Deleted-and-recreated buckets (same name, different instance)
+  - Resharded buckets (same name, new instance)
 - **Time period filtering**: Use `--start-period-utc` and `--end-period-utc` to filter orphans by object mtime. When a time filter is set and an object's mtime cannot be determined, it is conservatively **skipped** (not deleted).
 - **Multiple passes required**: Orphans can have dependencies. Deleting an orphan instance may reveal orphaned index objects, and vice versa. Run the script 2-3 times to fully clean up all cascading orphans.
 
@@ -618,31 +660,6 @@ cephadm shell
 python3 /root/rgw-sync-repair.py --check --bucket tenant/bucket1
 ```
 
-### Remote via SSH + mount
-
-```bash
-# Copy file and mount the cephadm home directory into container /root
-scp rgw-sync-repair.py root@gva2b-object-cephmon-1:/var/lib/ceph/<fsid>/home/
-ssh root@gva2b-object-cephmon-1 'cephadm shell --mount /var/lib/ceph/<fsid>/home/:/root -- python3 /root/rgw-sync-repair.py --check --bucket tenant/bucket1'
-
-# Fix with same method
-ssh root@gva2b-object-cephmon-1 'cephadm shell --mount /var/lib/ceph/<fsid>/home/:/root -- python3 /root/rgw-sync-repair.py   --reset-sync --bucket tenant/bucket1'
-```
-
-### Full Example for Production
-
-```bash
-# 1. Copy script to Ceph mon nodes
-for node in gva2a-object-cephmon-1 gva2b-object-cephmon-1; do
-  scp rgw-sync-repair.py root@$node:/var/lib/ceph/<fsid>/home/
-done
-
-# 2. Check a bucket across zones
-ssh root@gva2b-object-cephmon-1 'cephadm shell --mount /var/lib/ceph/<fsid>/home/:/root -- python3 /root/rgw-sync-repair.py --check --bucket tenant/bucket1 --json'
-```
-
-> **Note**: Piping the script via stdin (`cat script.py | ssh ... cephadm shell -- python3 -`) does **not** work because `cephadm shell` stdio piping causes stdout to be lost. Always copy the script to `/var/lib/ceph/<fsid>/home/` and mount it, or run interactively inside the container.
-
 ## Output Format for Sync Repair
 
 ### Check Mode
@@ -746,13 +763,14 @@ Sync markers on the secondary zone keep pointing to the **old bilog**. The secon
 
 **Typical workflow:**
 ```bash
-# 1. Clean stale metadata objects
-python3 rgw-sync-gc.py --delete --yes-i-really-mean-it
+# Full cleanup including data objects
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --data-pool
 
-# 2. Fix stuck sync markers on specific buckets
-python3 rgw-sync-repair.py --check-all --json | jq '.results[] | select(.status=="failed") | .bucket'
-# Then for each stuck bucket:
-python3 rgw-sync-repair.py   --reset-sync --bucket tenant/stuck-bucket
+# DANGEROUS: also delete stale instances
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --delete-stale
+
+# Also clean stale sync log entries (from deleted buckets)
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --delete-sync-logs
 ```
 
 **Exit Codes:**

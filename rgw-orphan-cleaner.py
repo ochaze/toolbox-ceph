@@ -100,6 +100,12 @@ class RGWZone:
         if not self.index_pool:
             raise RuntimeError("Could not determine index pool")
 
+        # Log pool for sync status entries
+        self.log_pool = zone_info.get("log_pool")
+        if not self.log_pool:
+            # Fallback to standard naming
+            self.log_pool = f"{self.name}.rgw.log"
+
 
 class OrphanDetector:
     """Detects orphaned bucket metadata and data across RADOS pools."""
@@ -822,6 +828,15 @@ class OrphanDetector:
                     "end_period_utc": self.end_period.isoformat() if self.end_period else None,
                 },
             },
+            "orphans": {
+                "transient_instances": transient_instances,
+                "instances": orphan_instances,
+                "stale_instances": stale_instances,
+                "entrypoints": orphan_entrypoints,
+                "index": orphan_index,
+                "data": list(orphan_data.values()),
+            },
+            "skipped": skipped_instances,
             "summary": {
                 "total_orphans": len(orphan_instances)
                 + len(stale_instances)
@@ -846,15 +861,6 @@ class OrphanDetector:
                 if self.scan_data_pool
                 else 0,
             },
-            "orphans": {
-                "instances": orphan_instances,
-                "transient_instances": transient_instances,
-                "stale_instances": stale_instances,
-                "entrypoints": orphan_entrypoints,
-                "index": orphan_index,
-                "data": list(orphan_data.values()),
-            },
-            "skipped": skipped_instances,
         }
 
 
@@ -962,6 +968,111 @@ class OrphanCleaner:
         return results
 
 
+def _parse_sync_log_oid(oid: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract (bucket_name, bucket_id) from a sync log pool OID.
+
+    Expected formats:
+      bucket.sync-status.<zone_id>:<tenant>/<bucket>:<bucket_id>:<shard>
+      bucket.full-sync-status.<zone_id>:<tenant>/<bucket>:<bucket_id>
+      (tenant may be empty)
+    """
+    # Strip the prefix
+    if oid.startswith("bucket.sync-status."):
+        rest = oid[len("bucket.sync-status."):]
+    elif oid.startswith("bucket.full-sync-status."):
+        rest = oid[len("bucket.full-sync-status."):]
+    else:
+        return None, None
+
+    # Bucket ID is reliably identifiable: UUID-like component with two numeric suffixes
+    match = re.search(r'([a-f0-9-]+\.\d+\.\d+)', rest)
+    if not match:
+        return None, None
+    bucket_id = match.group(1)
+
+    # Everything before the bucket_id contains the bucket name
+    prefix = rest[:match.start()]
+    # Drop the zone_id portion (everything up to first ':')
+    first_colon = prefix.find(':')
+    if first_colon == -1:
+        return None, None
+    bucket_context = prefix[first_colon + 1:]
+    # Trim leading/trailing ':' artifacts from empty tenant (::)
+    bucket_context = bucket_context.lstrip(':').rstrip(':')
+    # Extract bucket name after tenant separator
+    if '/' in bucket_context:
+        bucket_name = bucket_context.split('/', 1)[1]
+    else:
+        bucket_name = bucket_context
+    return bucket_name, bucket_id
+
+
+def check_sync_logs(
+    zone: RGWZone,
+    known_instances: Set[str],
+    known_entrypoints: Set[str],
+    delete: bool = False,
+) -> Tuple[int, List[str], List[Dict]]:
+    """Check for stale bucket.sync-status entries in the log pool.
+
+    Returns (count, list_of_stale_oids, removed_items).
+    If delete=True, actually removes the stale entries via rados rm.
+    An entry is considered stale only when BOTH the instance AND the entrypoint
+    are absent from known_instances / known_entrypoints — this avoids flagging
+    sync logs for buckets that have been deleted and recreated with the same name.
+    """
+    removed = []
+    stale_oids = []
+    try:
+        proc = subprocess.Popen(
+            ["rados", "-p", zone.log_pool, "ls"],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            if not line.startswith(
+                ("bucket.sync-status.", "bucket.full-sync-status.")):
+                continue
+
+            bucket_name, bucket_id = _parse_sync_log_oid(line)
+            if not bucket_name and not bucket_id:
+                continue
+
+            # Safety: only consider stale when both instance AND entrypoint are gone
+            has_instance = False
+            has_entrypoint = False
+            if bucket_id:
+                has_instance = bucket_id in known_instances
+            if bucket_name:
+                has_entrypoint = bucket_name in known_entrypoints
+
+            if has_instance or has_entrypoint:
+                # Sync log still references a live bucket → skip
+                continue
+
+            stale_oids.append(line)
+            if delete:
+                rc, _, err = subprocess.run(
+                    ["rados", "-p", zone.log_pool, "rm", line],
+                    capture_output=True,
+                    text=True,
+                ).returncode, "", ""
+                if rc == 0:
+                    removed.append({"oid": line, "pool": zone.log_pool, "status": "removed"})
+                else:
+                    removed.append({"oid": line, "pool": zone.log_pool, "status": "failed", "error": err.strip()})
+        proc.stdout.close()
+        proc.wait()
+    except Exception as e:
+        # Log pool access failure is non-fatal
+        print(f"# WARNING: Could not scan log pool {zone.log_pool}: {e}", file=sys.stderr)
+
+    return len(stale_oids), stale_oids, removed
+
+
 def print_report(report: Dict):
     print(json.dumps(report, indent=2))
 
@@ -1029,6 +1140,12 @@ def main():
         default=None,
         help="Only include orphans/objects modified up to this UTC time (ISO 8601, e.g. 2024-12-31T23:59:59Z)"
     )
+    parser.add_argument(
+        "--delete-sync-logs",
+        action="store_true",
+        default=False,
+        help="When used with --delete, also remove stale bucket.sync-status entries from the zone log pool. Detection is always performed automatically."
+    )
     args = parser.parse_args()
 
     # Parse time period arguments
@@ -1065,6 +1182,145 @@ def main():
     detector.discover()
     report = detector.detect()
 
+    # --- Sync log check: always detect ---
+    # Build sets of known (live) bucket names and instance IDs from metadata
+    known_instances: Set[str] = set(detector.instances.keys())
+    known_entrypoints: Set[str] = set(detector.meta_entrypoints) | set(detector.rados_entrypoints)
+
+    sync_count, sync_oids, _ = check_sync_logs(
+        zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=False
+    )
+    report["sync_logs"] = {
+        "log_pool": zone.log_pool,
+        "total_entries": sync_count,
+        "sample_oids": sync_oids[:10],
+        "deleted": False,
+        "removed_count": 0,
+        "failed_count": 0,
+        "entries": [],
+    }
+
+    total = report["summary"]["total_orphans"]
+    total_data = report["summary"]["total_data_orphans"]
+    total_transient = report["summary"]["total_transient_instances"]
+
+    # --- Deletion mode ---
+    anything_to_clean = total > 0 or total_data > 0 or total_transient > 0 or sync_count > 0
+    if args.delete and anything_to_clean:
+        if not args.yes_i_really_mean_it:
+            transient_msg = ""
+            if total_transient > 0:
+                transient_msg = f" + {total_transient} transient instance(s)"
+            sync_msg = ""
+            if sync_count > 0 and args.delete_sync_logs:
+                sync_msg = f" + {sync_count} sync log entries"
+            print(
+                f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s){sync_msg}. Proceed? [y/N] ",
+                end="",
+                file=sys.stderr,
+            )
+            try:
+                response = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                response = "n"
+            if response not in ("y", "yes"):
+                print("# Aborted.", file=sys.stderr)
+                # Still emit JSON report before exit
+                json_report = json.dumps(report, indent=2)
+                if args.output == "-":
+                    print(json_report)
+                else:
+                    with open(args.output, "w") as f:
+                        f.write(json_report + "\n")
+                sys.exit(1)
+
+        cleaner = OrphanCleaner(zone)
+        all_orphans = (
+            report["orphans"]["instances"]
+            + report["orphans"]["entrypoints"]
+            + report["orphans"]["index"]
+        )
+
+        # Include transient instances only if --include-transient is explicitly requested
+        if args.include_transient and report["orphans"].get("transient_instances"):
+            transient_count = len(report["orphans"]["transient_instances"])
+            print(
+                f"# INFO: Including {transient_count} transient instance(s) for deletion. "
+                "Normally these are cleaned up by BucketTrimInstanceCR.",
+                file=sys.stderr,
+            )
+            all_orphans += report["orphans"]["transient_instances"]
+
+        # Include stale instances only if --delete-stale is explicitly requested
+        if args.delete_stale and report["orphans"].get("stale_instances"):
+            stale_count = len(report["orphans"]["stale_instances"])
+            print(
+                f"# WARNING: Including {stale_count} stale instance(s) for deletion. "
+                "This can corrupt active buckets if they are being resharded!",
+                file=sys.stderr,
+            )
+            all_orphans += report["orphans"]["stale_instances"]
+
+        if not all_orphans and total_data == 0:
+            if total_transient > 0 and not args.include_transient:
+                print(
+                    f"# No true orphans to remove ({total_transient} transient instance(s) skipped, "
+                    "use --include-transient to clean them up).",
+                    file=sys.stderr,
+                )
+            else:
+                print("# No orphans to remove.", file=sys.stderr)
+        else:
+            # Clean metadata orphans
+            for item in all_orphans:
+                ok = cleaner.remove(item, dry_run=False)
+                status = "removed" if ok else "FAILED"
+                print(f"# {status}: {item.get('type', item.get('bucket_id', 'unknown'))} {item['oid']}", file=sys.stderr)
+
+            # Clean data orphans
+            if args.data_pool and total_data > 0:
+                data_orphans = report["orphans"]["data"]
+                total_buckets = len(data_orphans)
+                total_objects = report["summary"]["total_data_orphan_objects"]
+
+                print(f"# Starting data cleanup: {total_buckets} bucket IDs, ~{total_objects} total objects", file=sys.stderr)
+
+                # Collect all bucket IDs and do a single streaming pass
+                bucket_ids = set(d["bucket_id"] for d in data_orphans)
+                pool = data_orphans[0]["pool"] if data_orphans else zone.data_pool
+                results = cleaner.stream_remove_by_prefix(bucket_ids, pool, dry_run=False)
+
+                for data_entry in data_orphans:
+                    bucket_id = data_entry["bucket_id"]
+                    removed, failed = results.get(bucket_id, (0, 0))
+                    data_entry["removed_count"] = removed
+                    data_entry["failed_count"] = failed
+                    print(f"# Completed {bucket_id}: {removed} removed, {failed} failed", file=sys.stderr)
+
+        # Clean stale sync logs (after user confirmed deletion)
+        if args.delete_sync_logs and sync_count > 0:
+            print(f"# Deleting {sync_count} stale sync log entries from {zone.log_pool}...", file=sys.stderr)
+            _, _, sync_removed = check_sync_logs(
+                zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=True
+            )
+            report["sync_logs"]["deleted"] = True
+            report["sync_logs"]["removed_count"] = len([r for r in sync_removed if r.get("status") == "removed"])
+            report["sync_logs"]["failed_count"] = len([r for r in sync_removed if r.get("status") == "failed"])
+            report["sync_logs"]["entries"] = sync_removed
+            print(f"# Sync logs: {report['sync_logs']['removed_count']} removed, {report['sync_logs']['failed_count']} failed", file=sys.stderr)
+
+        # Attach cleanup summary to the report
+        report["cleanup"] = {
+            "cleanup_completed": True,
+            "metadata_removed": len(cleaner.removed),
+            "metadata_failed": len(cleaner.failed),
+            "details": {
+                "removed": cleaner.removed,
+                "failed": cleaner.failed
+            }
+        }
+
+    # --- JSON summary is printed first ---
     json_report = json.dumps(report, indent=2)
     if args.output == "-":
         print(json_report)
@@ -1072,15 +1328,10 @@ def main():
         with open(args.output, "w") as f:
             f.write(json_report + "\n")
 
-    total = report["summary"]["total_orphans"]
-    total_data = report["summary"]["total_data_orphans"]
-    total_transient = report["summary"]["total_transient_instances"]
-
+    # --- Text summary to stderr (at the bottom) ---
     if total == 0 and total_data == 0 and total_transient == 0:
         print("# No orphaned metadata or data found.", file=sys.stderr)
-        sys.exit(0)
-
-    if not args.delete:
+    else:
         print(
             f"# Found {total} metadata orphan(s). Use --delete to clean up.",
             file=sys.stderr,
@@ -1091,105 +1342,25 @@ def main():
                 "These will be cleaned up by BucketTrimInstanceCR. Use --delete --include-transient to force cleanup.",
                 file=sys.stderr,
             )
-        if total_data > 0:
-            total_data_objs = report["summary"]["total_data_orphan_objects"]
+    if total_data > 0:
+        total_data_objs = report["summary"]["total_data_orphan_objects"]
+        print(
+            f"# Found {total_data} data bucket ID(s) with ~{total_data_objs} orphan objects. Use --delete --data-pool to clean up.",
+            file=sys.stderr,
+        )
+
+    # --- Sync log summary (always detected) ---
+    if "sync_logs" in report:
+        sync_info = report["sync_logs"]
+        print(
+            f"# Found {sync_info['total_entries']} stale sync log entries in {sync_info['log_pool']}.",
+            file=sys.stderr,
+        )
+        if sync_info.get("deleted"):
             print(
-                f"# Found {total_data} data bucket ID(s) with ~{total_data_objs} orphan objects. Use --delete --data-pool to clean up.",
+                f"# Removed {sync_info.get('removed_count', 0)}, failed {sync_info.get('failed_count', 0)}.",
                 file=sys.stderr,
             )
-        sys.exit(0)
-
-    if not args.yes_i_really_mean_it:
-        transient_msg = ""
-        if total_transient > 0:
-            transient_msg = f" + {total_transient} transient instance(s)"
-        print(
-            f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s). Proceed? [y/N] ",
-            end="",
-            file=sys.stderr,
-        )
-        try:
-            response = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            response = "n"
-        if response not in ("y", "yes"):
-            print("# Aborted.", file=sys.stderr)
-            sys.exit(1)
-
-    cleaner = OrphanCleaner(zone)
-    all_orphans = (
-        report["orphans"]["instances"]
-        + report["orphans"]["entrypoints"]
-        + report["orphans"]["index"]
-    )
-
-    # Include transient instances only if --include-transient is explicitly requested
-    if args.include_transient and report["orphans"].get("transient_instances"):
-        transient_count = len(report["orphans"]["transient_instances"])
-        print(
-            f"# INFO: Including {transient_count} transient instance(s) for deletion. "
-            "Normally these are cleaned up by BucketTrimInstanceCR.",
-            file=sys.stderr,
-        )
-        all_orphans += report["orphans"]["transient_instances"]
-
-    # Include stale instances only if --delete-stale is explicitly requested
-    if args.delete_stale and report["orphans"].get("stale_instances"):
-        stale_count = len(report["orphans"]["stale_instances"])
-        print(
-            f"# WARNING: Including {stale_count} stale instance(s) for deletion. "
-            "This can corrupt active buckets if they are being resharded!",
-            file=sys.stderr,
-        )
-        all_orphans += report["orphans"]["stale_instances"]
-
-    if not all_orphans and total_data == 0:
-        if total_transient > 0 and not args.include_transient:
-            print(
-                f"# No true orphans to remove ({total_transient} transient instance(s) skipped, "
-                "use --include-transient to clean them up).",
-                file=sys.stderr,
-            )
-        else:
-            print("# No orphans to remove.", file=sys.stderr)
-        sys.exit(0)
-
-    # Clean metadata orphans
-    for item in all_orphans:
-        ok = cleaner.remove(item, dry_run=False)
-        status = "removed" if ok else "FAILED"
-        print(f"# {status}: {item.get('type', item.get('bucket_id', 'unknown'))} {item['oid']}", file=sys.stderr)
-
-    # Clean data orphans
-    if args.data_pool and total_data > 0:
-        data_orphans = report["orphans"]["data"]
-        total_buckets = len(data_orphans)
-        total_objects = report["summary"]["total_data_orphan_objects"]
-
-        print(f"# Starting data cleanup: {total_buckets} bucket IDs, ~{total_objects} total objects", file=sys.stderr)
-
-        # Collect all bucket IDs and do a single streaming pass
-        bucket_ids = set(d["bucket_id"] for d in data_orphans)
-        pool = data_orphans[0]["pool"] if data_orphans else zone.data_pool
-        results = cleaner.stream_remove_by_prefix(bucket_ids, pool, dry_run=False)
-
-        for data_entry in data_orphans:
-            bucket_id = data_entry["bucket_id"]
-            removed, failed = results.get(bucket_id, (0, 0))
-            data_entry["removed_count"] = removed
-            data_entry["failed_count"] = failed
-            print(f"# Completed {bucket_id}: {removed} removed, {failed} failed", file=sys.stderr)
-
-    summary = {
-        "cleanup_completed": True,
-        "metadata_removed": len(cleaner.removed),
-        "metadata_failed": len(cleaner.failed),
-        "details": {
-            "removed": cleaner.removed,
-            "failed": cleaner.failed
-        }
-    }
-    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":
