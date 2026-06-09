@@ -187,7 +187,7 @@ This cross-reference approach is **safe for buckets that were deleted and recrea
 
 **Usage:**
 - Detection is automatic (checked on every run)
-- Deletion requires both `--delete` and `--delete-sync-logs`
+- Deletion requires both `--delete` and `--include-sync-logs`
 - Only sync log entries that pass the safety check are deleted
 
 > **Note:** Sync logs are cleaned **after** the metadata cleanup is complete, but still subject to the same confirmation prompt (`--yes-i-really-mean-it` or interactive prompt).
@@ -337,7 +337,7 @@ The script outputs JSON with the following structure:
    - **id in known_instances?** → bucket instance still exists → **NOT stale**
    - **name in known_entrypoints?** → bucket entrypoint still exists → **NOT stale**
 3. Only flags as stale when **both** checks fail
-4. If `--delete --delete-sync-logs`, removes stale entries via `rados rm`
+4. If `--delete --include-sync-logs`, removes stale entries via `rados rm`
 
 ### Data Detection
 
@@ -770,7 +770,7 @@ python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --data-pool
 python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --delete-stale
 
 # Also clean stale sync log entries (from deleted buckets)
-python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --delete-sync-logs
+python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it --include-sync-logs
 ```
 
 **Exit Codes:**

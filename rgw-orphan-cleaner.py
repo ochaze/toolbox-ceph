@@ -1141,7 +1141,7 @@ def main():
         help="Only include orphans/objects modified up to this UTC time (ISO 8601, e.g. 2024-12-31T23:59:59Z)"
     )
     parser.add_argument(
-        "--delete-sync-logs",
+        "--include-sync-logs",
         action="store_true",
         default=False,
         help="When used with --delete, also remove stale bucket.sync-status entries from the zone log pool. Detection is always performed automatically."
@@ -1212,7 +1212,7 @@ def main():
             if total_transient > 0:
                 transient_msg = f" + {total_transient} transient instance(s)"
             sync_msg = ""
-            if sync_count > 0 and args.delete_sync_logs:
+            if sync_count > 0 and args.include_sync_logs:
                 sync_msg = f" + {sync_count} sync log entries"
             print(
                 f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s){sync_msg}. Proceed? [y/N] ",
@@ -1298,7 +1298,7 @@ def main():
                     print(f"# Completed {bucket_id}: {removed} removed, {failed} failed", file=sys.stderr)
 
         # Clean stale sync logs (after user confirmed deletion)
-        if args.delete_sync_logs and sync_count > 0:
+        if args.include_sync_logs and sync_count > 0:
             print(f"# Deleting {sync_count} stale sync log entries from {zone.log_pool}...", file=sys.stderr)
             _, _, sync_removed = check_sync_logs(
                 zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=True
@@ -1353,7 +1353,7 @@ def main():
     if "sync_logs" in report:
         sync_info = report["sync_logs"]
         print(
-            f"# Found {sync_info['total_entries']} stale sync log entries in {sync_info['log_pool']}.",
+            f"# Found {sync_info['total_entries']} stale sync log entries in {sync_info['log_pool']}. Use --delete --include-sync-logs to clean up.",
             file=sys.stderr,
         )
         if sync_info.get("deleted"):
