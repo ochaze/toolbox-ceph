@@ -5,7 +5,7 @@ RGW Complete Orphan Cleaner
 Detects and optionally cleans:
   - Orphan bucket instance metadata (instance without entrypoint, flags=0)
     → Race condition: entrypoint removed but BUCKET_DELETED never set. Requires manual cleanup.
-  - Transient bucket instance metadata (instance without entrypoint, flags=BUCKET_DELETED=64)
+  - Transient bucket instance metadata (instance without entrypoint, BUCKET_DELETED bit set: 64/66)
     → BucketTrimInstanceCR will clean these up automatically. Optionally force-cleanup with --include-transient.
   - Stale instances from resharding (entrypoint points elsewhere)
   - Orphan bucket index objects (index without known instance)
@@ -14,7 +14,7 @@ Detects and optionally cleans:
 Usage:
     python3 rgw-orphan-cleaner.py                  # detection only
     python3 rgw-orphan-cleaner.py --delete         # cleanup after confirmation
-    python3 rgw-orphan-cleaner.py --delete --yes   # no prompt
+    python3 rgw-orphan-cleaner.py --delete --yes-really-mean-it   # no prompt
     python3 rgw-orphan-cleaner.py --data-pool      # include data pool scan
 
 Output: JSON report to stdout
@@ -343,7 +343,7 @@ class OrphanDetector:
                      Tenant separator '/' is converted to ':' for the metadata key.
 
         Returns:
-            The flags integer value (e.g. 0, 64=BUCKET_DELETED), or None on error.
+            The flags integer value (e.g. 0, 64=BUCKET_DELETED, 66=BUCKET_DELETED|BUCKET_VERSIONED), or None on error.
         """
         if ep_name:
             instance_name = ep_name.replace("/", ":", 1)
@@ -688,9 +688,10 @@ class OrphanDetector:
                         }
                         skipped_instances.append(entry)
                     else:
-                        # Check flags to differentiate true orphans from transient
+                        # Check if BUCKET_DELETED bit is set (bit 6 = 64)
+                        # flags 64 = BUCKET_DELETED, 66 = BUCKET_DELETED|BUCKET_VERSIONED
                         flags = self._get_instance_flags(bucket_id, ep_name)
-                        if flags == 64:
+                        if flags is not None and flags & 64:
                             # BUCKET_DELETED - BucketTrimInstanceCR will clean this up
                             transient_instances.append({
                                 "type": "transient_instance_marked",
@@ -701,7 +702,7 @@ class OrphanDetector:
                                 "namespace": "root",
                                 "tenant": info["tenant"],
                                 "flags": flags,
-                                "reason": "BucketTrimInstanceCR will clean this up (flags=BUCKET_DELETED)",
+                                "reason": "BucketTrimInstanceCR will clean this up (BUCKET_DELETED bit set in flags: 64/66)",
                             })
                         elif flags == 0:
                             # Race condition: entrypoint removed but flags never set
@@ -1013,15 +1014,15 @@ def check_sync_logs(
     known_entrypoints: Set[str],
     delete: bool = False,
 ) -> Tuple[int, List[str], List[Dict]]:
-    """Check for stale bucket.sync-status entries in the log pool.
+    """Check for stale bucket.sync-status and sync-hint entries in the log pool.
 
-    Returns (count, list_of_stale_oids, removed_items).
+    Returns (count, list_of_stale_oids, detected_items).
     If delete=True, actually removes the stale entries via rados rm.
     An entry is considered stale only when BOTH the instance AND the entrypoint
     are absent from known_instances / known_entrypoints — this avoids flagging
     sync logs for buckets that have been deleted and recreated with the same name.
     """
-    removed = []
+    detected = []
     stale_oids = []
     try:
         proc = subprocess.Popen(
@@ -1033,27 +1034,53 @@ def check_sync_logs(
             line = line.strip()
             if not line:
                 continue
-            if not line.startswith(
-                ("bucket.sync-status.", "bucket.full-sync-status.")):
+
+            is_stale = False
+            bucket_name = None
+            bucket_id = None
+
+            if line.startswith(("bucket.sync-status.", "bucket.full-sync-status.")):
+                bucket_name, bucket_id = _parse_sync_log_oid(line)
+                if not bucket_name and not bucket_id:
+                    continue
+
+                # Safety: only consider stale when both instance AND entrypoint are gone
+                has_instance = bucket_id and bucket_id in known_instances
+                has_entrypoint = bucket_name and bucket_name in known_entrypoints
+
+                if not has_instance and not has_entrypoint:
+                    is_stale = True
+
+            elif line.startswith(("bucket.sync-source-hints.", "bucket.sync-target-hints.")):
+                # Format: bucket.sync-source-hints.<tenant>/<bucket>
+                # or bucket.sync-source-hints.<bucket> (no tenant)
+                if line.startswith("bucket.sync-source-hints."):
+                    rest = line[len("bucket.sync-source-hints."):]
+                else:
+                    rest = line[len("bucket.sync-target-hints."):]
+
+                if "/" in rest:
+                    tenant, bucket_name = rest.split("/", 1)
+                else:
+                    tenant = ""
+                    bucket_name = rest
+
+                ep_name = f"{tenant}/{bucket_name}" if tenant else bucket_name
+                if ep_name not in known_entrypoints:
+                    is_stale = True
+            else:
                 continue
 
-            bucket_name, bucket_id = _parse_sync_log_oid(line)
-            if not bucket_name and not bucket_id:
-                continue
-
-            # Safety: only consider stale when both instance AND entrypoint are gone
-            has_instance = False
-            has_entrypoint = False
-            if bucket_id:
-                has_instance = bucket_id in known_instances
-            if bucket_name:
-                has_entrypoint = bucket_name in known_entrypoints
-
-            if has_instance or has_entrypoint:
-                # Sync log still references a live bucket → skip
+            if not is_stale:
                 continue
 
             stale_oids.append(line)
+            item: Dict[str, str] = {"oid": line, "pool": zone.log_pool, "status": "detected"}
+            if bucket_id:
+                item["bucket_id"] = bucket_id
+            if bucket_name:
+                item["bucket_name"] = bucket_name
+
             if delete:
                 rc, _, err = subprocess.run(
                     ["rados", "-p", zone.log_pool, "rm", line],
@@ -1061,16 +1088,20 @@ def check_sync_logs(
                     text=True,
                 ).returncode, "", ""
                 if rc == 0:
-                    removed.append({"oid": line, "pool": zone.log_pool, "status": "removed"})
+                    item["status"] = "removed"
                 else:
-                    removed.append({"oid": line, "pool": zone.log_pool, "status": "failed", "error": err.strip()})
+                    item["status"] = "failed"
+                    item["error"] = err.strip()
+
+            detected.append(item)
+
         proc.stdout.close()
         proc.wait()
     except Exception as e:
         # Log pool access failure is non-fatal
         print(f"# WARNING: Could not scan log pool {zone.log_pool}: {e}", file=sys.stderr)
 
-    return len(stale_oids), stale_oids, removed
+    return len(stale_oids), stale_oids, detected
 
 
 def print_report(report: Dict):
@@ -1126,7 +1157,7 @@ def main():
         "--include-transient",
         action="store_true",
         default=False,
-        help="Include transient instances (flags=BUCKET_DELETED) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
+        help="Include transient instances (BUCKET_DELETED bit set in flags: 64/66) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
     )
     parser.add_argument(
         "--start-period-utc",
@@ -1187,7 +1218,7 @@ def main():
     known_instances: Set[str] = set(detector.instances.keys())
     known_entrypoints: Set[str] = set(detector.meta_entrypoints) | set(detector.rados_entrypoints)
 
-    sync_count, sync_oids, _ = check_sync_logs(
+    sync_count, sync_oids, sync_detected = check_sync_logs(
         zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=False
     )
     report["sync_logs"] = {
@@ -1197,7 +1228,7 @@ def main():
         "deleted": False,
         "removed_count": 0,
         "failed_count": 0,
-        "entries": [],
+        "entries": sync_detected,
     }
 
     total = report["summary"]["total_orphans"]
@@ -1338,7 +1369,7 @@ def main():
         )
         if total_transient > 0:
             print(
-                f"# Found {total_transient} transient instance(s) (flags=BUCKET_DELETED). "
+                f"# Found {total_transient} transient instance(s) (BUCKET_DELETED bit set in flags: 64/66). "
                 "These will be cleaned up by BucketTrimInstanceCR. Use --delete --include-transient to force cleanup.",
                 file=sys.stderr,
             )
@@ -1352,10 +1383,13 @@ def main():
     # --- Sync log summary (always detected) ---
     if "sync_logs" in report:
         sync_info = report["sync_logs"]
-        print(
-            f"# Found {sync_info['total_entries']} stale sync log entries in {sync_info['log_pool']}. Use --delete --include-sync-logs to clean up.",
-            file=sys.stderr,
-        )
+        if sync_info["total_entries"] == 0:
+            print("# No orphan sync log found.", file=sys.stderr)
+        else:
+            print(
+                f"# Found {sync_info['total_entries']} stale sync log entries in {sync_info['log_pool']}. Use --delete --include-sync-logs to clean up.",
+                file=sys.stderr,
+            )
         if sync_info.get("deleted"):
             print(
                 f"# Removed {sync_info.get('removed_count', 0)}, failed {sync_info.get('failed_count', 0)}.",
