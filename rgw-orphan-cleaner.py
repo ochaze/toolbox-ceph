@@ -3,10 +3,17 @@
 RGW Complete Orphan Cleaner
 
 Detects and optionally cleans:
-  - Orphan bucket instance metadata (instance without entrypoint, flags=0)
-    → Race condition: entrypoint removed but BUCKET_DELETED never set. Requires manual cleanup.
-  - Transient bucket instance metadata (instance without entrypoint, BUCKET_DELETED bit set: 64/66)
+  - Orphan bucket instance metadata (instance without entrypoint, flags=0/2/34)
+    → Race condition: entrypoint removed but BUCKET_DELETED never set.
+      0  = active bucket
+      2  = BUCKET_VERSIONED (active versioned bucket)
+      34 = BUCKET_VERSIONED|BUCKET_OBJ_LOCK_ENABLED (versioned + lock)
+      Requires manual cleanup.
+  - Transient bucket instance metadata (instance without entrypoint, BUCKET_DELETED bit set in flags: 64/66/98)
     → BucketTrimInstanceCR will clean these up automatically. Optionally force-cleanup with --include-transient.
+      64 = BUCKET_DELETED
+      66 = BUCKET_DELETED|BUCKET_VERSIONED
+      98 = BUCKET_DELETED|BUCKET_VERSIONED|BUCKET_OBJ_LOCK_ENABLED (deleted + versioned + lock)
   - Stale instances from resharding (entrypoint points elsewhere)
   - Orphan bucket index objects (index without known instance)
   - Orphan data objects (data without known bucket instance)
@@ -343,7 +350,9 @@ class OrphanDetector:
                      Tenant separator '/' is converted to ':' for the metadata key.
 
         Returns:
-            The flags integer value (e.g. 0, 64=BUCKET_DELETED, 66=BUCKET_DELETED|BUCKET_VERSIONED), or None on error.
+            The flags integer value (e.g. 0, 34=BUCKET_VERSIONED|BUCKET_OBJ_LOCK_ENABLED,
+            64=BUCKET_DELETED, 66=BUCKET_DELETED|BUCKET_VERSIONED,
+            98=BUCKET_DELETED|BUCKET_VERSIONED|BUCKET_OBJ_LOCK_ENABLED), or None on error.
         """
         if ep_name:
             instance_name = ep_name.replace("/", ":", 1)
@@ -689,10 +698,11 @@ class OrphanDetector:
                         skipped_instances.append(entry)
                     else:
                         # Check if BUCKET_DELETED bit is set (bit 6 = 64)
-                        # flags 64 = BUCKET_DELETED, 66 = BUCKET_DELETED|BUCKET_VERSIONED
+                        # flags: 64=BUCKET_DELETED, 66=BUCKET_DELETED|BUCKET_VERSIONED,
+                        #        98=BUCKET_DELETED|BUCKET_VERSIONED|BUCKET_OBJ_LOCK_ENABLED
                         flags = self._get_instance_flags(bucket_id, ep_name)
                         if flags is not None and flags & 64:
-                            # BUCKET_DELETED - BucketTrimInstanceCR will clean this up
+                            # BUCKET_DELETED bit set - BucketTrimInstanceCR will clean this up
                             transient_instances.append({
                                 "type": "transient_instance_marked",
                                 "bucket_name": ep_name,
@@ -702,10 +712,11 @@ class OrphanDetector:
                                 "namespace": "root",
                                 "tenant": info["tenant"],
                                 "flags": flags,
-                                "reason": "BucketTrimInstanceCR will clean this up (BUCKET_DELETED bit set in flags: 64/66)",
+                                "reason": "BucketTrimInstanceCR will clean this up (BUCKET_DELETED bit set in flags: 64/66/98)",
                             })
-                        elif flags == 0:
+                        elif flags == 0 or flags == 2 or flags == 34:
                             # Race condition: entrypoint removed but flags never set
+                            # 0=active bucket, 2=BUCKET_VERSIONED (active versioned), 34=versioned+lock
                             orphan_instances.append({
                                 "type": "orphan_instance_race",
                                 "bucket_name": ep_name,
@@ -715,7 +726,7 @@ class OrphanDetector:
                                 "namespace": "root",
                                 "tenant": info["tenant"],
                                 "flags": flags,
-                                "reason": "Race condition: entrypoint removed but flags=0 (BUCKET_DELETED never set)",
+                                "reason": "Race condition: entrypoint removed but flags shows active (0/2=active, 34=versioned+lock active). BUCKET_DELETED never set",
                             })
                         else:
                             # Unknown or unexpected flags value
@@ -728,7 +739,7 @@ class OrphanDetector:
                                 "namespace": "root",
                                 "tenant": info["tenant"],
                                 "flags": flags,
-                                "reason": f"Unexpected flags value ({flags}) on orphan instance",
+                                "reason": f"Unexpected flags value ({flags}) on orphan instance (expected: 0/2=active, 34=versioned+lock, 64/66/98=deleted)",
                             })
 
         # Entrypoint in RADOS but no instance
@@ -1157,7 +1168,7 @@ def main():
         "--include-transient",
         action="store_true",
         default=False,
-        help="Include transient instances (BUCKET_DELETED bit set in flags: 64/66) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
+        help="Include transient instances (BUCKET_DELETED bit set in flags: 64/66/98) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
     )
     parser.add_argument(
         "--start-period-utc",
