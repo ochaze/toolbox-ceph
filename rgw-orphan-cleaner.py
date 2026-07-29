@@ -21,7 +21,7 @@ Detects and optionally cleans:
 Usage:
     python3 rgw-orphan-cleaner.py                  # detection only
     python3 rgw-orphan-cleaner.py --delete         # cleanup after confirmation
-    python3 rgw-orphan-cleaner.py --delete --yes-really-mean-it   # no prompt
+    python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it   # no prompt
     python3 rgw-orphan-cleaner.py --data-pool      # include data pool scan
 
 Output: JSON report to stdout
@@ -904,6 +904,10 @@ class OrphanCleaner:
         finally:
             proc.stdout.close()
             proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"rados ls failed for {pool}/{namespace or ''}: return code {proc.returncode}"
+                )
 
     def remove(self, item: Dict, dry_run: bool = True) -> bool:
         oid = item["oid"]
@@ -1093,11 +1097,13 @@ def check_sync_logs(
                 item["bucket_name"] = bucket_name
 
             if delete:
-                rc, _, err = subprocess.run(
+                proc = subprocess.run(
                     ["rados", "-p", zone.log_pool, "rm", line],
                     capture_output=True,
                     text=True,
-                ).returncode, "", ""
+                )
+                rc = proc.returncode
+                err = proc.stderr
                 if rc == 0:
                     item["status"] = "removed"
                 else:
