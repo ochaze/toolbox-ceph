@@ -24,16 +24,71 @@ Usage:
     python3 rgw-orphan-cleaner.py --delete --yes-i-really-mean-it   # no prompt
     python3 rgw-orphan-cleaner.py --data-pool      # include data pool scan
 
+Bucket-scoped data cleanup:
+    python3 rgw-orphan-cleaner.py --bucket-id <zone_id>.<num>.<num> --data-pool
+    python3 rgw-orphan-cleaner.py --bucket <tenant>/<name> --data-pool
+    python3 rgw-orphan-cleaner.py --bucket-id <id> --data-pool --delete --parallel 32
+    For buckets known to RGW the bucket index is verified empty first (data is
+    only deleted when nothing live references it); override with --force.
+
 Output: JSON report to stdout
 """
 
 import argparse
 import json
 import re
+import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
+
+# Extra flags appended to every radosgw-admin invocation (set from --rgw-extra-args).
+RGW_EXTRA_ARGS: List[str] = []
+
+
+def _subprocess_run(cmd: List[str]) -> subprocess.CompletedProcess:
+    """Python 3.6-compatible subprocess.run(capture_output=True, text=True)."""
+    return subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+    )
+
+
+def _parse_iso8601(s: str) -> datetime:
+    """Parse an ISO 8601 timestamp into a timezone-aware datetime (Python 3.6-safe)."""
+    ts = s.strip()
+    if hasattr(datetime, "fromisoformat"):  # Python >= 3.7
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass  # fall through to regex (handles e.g. "+0000" without colon)
+    m = re.match(
+        r"^(\d{4})-(\d{2})-(\d{2})"
+        r"(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?)?"
+        r"(Z|[+-]\d{2}:?\d{2})?$",
+        ts,
+    )
+    if not m:
+        raise ValueError(f"Invalid ISO 8601 timestamp: {s}")
+    tz = timezone.utc
+    off = m.group(8)
+    if off and off != "Z":
+        digits = off[1:].replace(":", "")
+        delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:4] or 0))
+        tz = timezone(delta if off[0] == "+" else -delta)
+    micro = int((m.group(7) or "0").ljust(6, "0")[:6])
+    return datetime(
+        int(m.group(1)),
+        int(m.group(2)),
+        int(m.group(3)),
+        int(m.group(4) or 0),
+        int(m.group(5) or 0),
+        int(m.group(6) or 0),
+        micro,
+        tz,
+    )
 
 
 class RGWZone:
@@ -49,7 +104,9 @@ class RGWZone:
 
     def _run(self, cmd: List[str]) -> Tuple[int, str, str]:
         """Run a shell command and return (rc, stdout, stderr)."""
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if cmd and cmd[0] == "radosgw-admin":
+            cmd = cmd + RGW_EXTRA_ARGS
+        proc = _subprocess_run(cmd)
         return proc.returncode, proc.stdout, proc.stderr
 
     def _discover(self):
@@ -84,7 +141,10 @@ class RGWZone:
             elif isinstance(placement_pools, list):
                 # Prefer element with key='default-placement', fall back to first
                 for entry in placement_pools:
-                    if isinstance(entry, dict) and entry.get("key") == "default-placement":
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("key") == "default-placement"
+                    ):
                         found_val = entry.get("val")
                         break
                 if found_val is None and placement_pools:
@@ -117,21 +177,28 @@ class RGWZone:
 class OrphanDetector:
     """Detects orphaned bucket metadata and data across RADOS pools."""
 
-    def __init__(self, zone: RGWZone, verify_active: bool = False,
-                 inactive_tenants_only: bool = False, scan_data_pool: bool = False,
-                 start_period: Optional[datetime] = None,
-                 end_period: Optional[datetime] = None):
+    def __init__(
+        self,
+        zone: RGWZone,
+        verify_active: bool = False,
+        inactive_tenants_only: bool = False,
+        scan_data_pool: bool = False,
+        start_period: Optional[datetime] = None,
+        end_period: Optional[datetime] = None,
+    ):
         self.zone = zone
         self.verify_active = verify_active
         self.inactive_tenants_only = inactive_tenants_only
         self.scan_data_pool = scan_data_pool
         self.start_period = start_period
         self.end_period = end_period
-        self.entrypoints: Dict[str, str] = {}       # bucket_name -> bucket_id
-        self.instances: Dict[str, str] = {}         # bucket_id -> bucket_name
+        self.entrypoints: Dict[str, str] = {}  # bucket_name -> bucket_id
+        self.instances: Dict[str, str] = {}  # bucket_id -> bucket_name
         self.index_objects: Dict[str, List[str]] = {}  # bucket_id -> [oid, ...]
-        self.data_objects: Dict[str, int] = {}      # bucket_id -> count
-        self.data_oid_sample: Dict[str, str] = {}   # bucket_id -> representative oid (for mtime)
+        self.data_objects: Dict[str, int] = {}  # bucket_id -> count
+        self.data_oid_sample: Dict[
+            str, str
+        ] = {}  # bucket_id -> representative oid (for mtime)
 
         # Tracking from metadata API
         self.meta_entrypoints: Set[str] = set()
@@ -150,14 +217,18 @@ class OrphanDetector:
         self._bucket_stats_cache: Dict[str, bool] = {}
 
     def _run(self, cmd: List[str]) -> Tuple[int, str, str]:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if cmd and cmd[0] == "radosgw-admin":
+            cmd = cmd + RGW_EXTRA_ARGS
+        proc = _subprocess_run(cmd)
         return proc.returncode, proc.stdout, proc.stderr
 
     def _metadata_list(self, section: str) -> List[str]:
         """List keys via radosgw-admin metadata list <section>."""
         rc, out, err = self._run(["radosgw-admin", "metadata", "list", section])
         if rc != 0:
-            print(json.dumps({"error": f"metadata list {section} failed: {err.strip()}"}))
+            print(
+                json.dumps({"error": f"metadata list {section} failed: {err.strip()}"})
+            )
             sys.exit(1)
         return json.loads(out) if out.strip() else []
 
@@ -172,7 +243,7 @@ class OrphanDetector:
             cmd += ["-N", namespace]
         cmd += ["ls"]
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
         try:
             for line in proc.stdout:
                 line = line.strip()
@@ -208,9 +279,7 @@ class OrphanDetector:
                 mtime = data.get("mtime")
                 if mtime:
                     # JSON mtime typically looks like "2024-01-15T10:30:00.000000Z"
-                    # Handle ISO 8601 with timezone
-                    mtime = mtime.replace("Z", "+00:00")
-                    return datetime.fromisoformat(mtime)
+                    return _parse_iso8601(mtime)
             except (json.JSONDecodeError, ValueError):
                 pass
 
@@ -242,7 +311,9 @@ class OrphanDetector:
                         continue
         return None
 
-    def _is_oid_in_time_period(self, pool: str, namespace: str, oid: str) -> Tuple[bool, Optional[str]]:
+    def _is_oid_in_time_period(
+        self, pool: str, namespace: str, oid: str
+    ) -> Tuple[bool, Optional[str]]:
         """Check if a RADOS object's mtime falls within the configured time period.
 
         Returns (True, None) if the object is within the period.
@@ -273,16 +344,16 @@ class OrphanDetector:
         """Parse .bucket.meta OID into (tenant, bucket_name, bucket_id)."""
         if not oid.startswith(".bucket.meta."):
             return None
-        rest = oid[len(".bucket.meta."):]
+        rest = oid[len(".bucket.meta.") :]
         last_colon = rest.rfind(":")
         if last_colon == -1:
             return None
-        bucket_id = rest[last_colon + 1:]
+        bucket_id = rest[last_colon + 1 :]
         bucket_part = rest[:last_colon]
         first_colon = bucket_part.find(":")
         if first_colon != -1:
             tenant = bucket_part[:first_colon]
-            bucket_name = bucket_part[first_colon + 1:]
+            bucket_name = bucket_part[first_colon + 1 :]
         else:
             tenant = ""
             bucket_name = bucket_part
@@ -295,9 +366,12 @@ class OrphanDetector:
 
     def _get_entrypoint_bucket_id(self, ep_name: str) -> Optional[str]:
         """Read entrypoint metadata to get current active bucket_id."""
-        rc, out, err = self._run(
-            ["radosgw-admin", "metadata", "get", f"bucket:{ep_name}"]
-        )
+        rc, out, err = self._run([
+            "radosgw-admin",
+            "metadata",
+            "get",
+            f"bucket:{ep_name}",
+        ])
         if rc != 0:
             return None
         try:
@@ -306,7 +380,9 @@ class OrphanDetector:
         except (json.JSONDecodeError, AttributeError):
             return None
 
-    def _get_instance_reshard_status(self, bucket_id: str, ep_name: str = None) -> Optional[int]:
+    def _get_instance_reshard_status(
+        self, bucket_id: str, ep_name: str = None
+    ) -> Optional[int]:
         """Read bucket instance metadata to check reshard status.
 
         Args:
@@ -330,9 +406,7 @@ class OrphanDetector:
 
         instance_key = f"bucket.instance:{instance_name}:{bucket_id}"
 
-        rc, out, err = self._run(
-            ["radosgw-admin", "metadata", "get", instance_key]
-        )
+        rc, out, err = self._run(["radosgw-admin", "metadata", "get", instance_key])
         if rc != 0:
             return None
         try:
@@ -361,9 +435,7 @@ class OrphanDetector:
 
         instance_key = f"bucket.instance:{instance_name}:{bucket_id}"
 
-        rc, out, err = self._run(
-            ["radosgw-admin", "metadata", "get", instance_key]
-        )
+        rc, out, err = self._run(["radosgw-admin", "metadata", "get", instance_key])
         if rc != 0:
             return None
         try:
@@ -391,10 +463,14 @@ class OrphanDetector:
         if cache_key in self._bucket_stats_cache:
             return self._bucket_stats_cache[cache_key]
         bucket_arg = f"{tenant}/{bucket_name}" if tenant else bucket_name
-        rc, _, _ = self._run(
-            ["radosgw-admin", "bucket", "stats", "--bucket", bucket_arg]
-        )
-        is_active = (rc == 0)
+        rc, _, _ = self._run([
+            "radosgw-admin",
+            "bucket",
+            "stats",
+            "--bucket",
+            bucket_arg,
+        ])
+        is_active = rc == 0
         self._bucket_stats_cache[cache_key] = is_active
         return is_active
 
@@ -530,7 +606,9 @@ class OrphanDetector:
                     count += 1
                     bucket_id = self._extract_bucket_id_from_data_oid(oid)
                     if bucket_id:
-                        self.data_objects[bucket_id] = self.data_objects.get(bucket_id, 0) + 1
+                        self.data_objects[bucket_id] = (
+                            self.data_objects.get(bucket_id, 0) + 1
+                        )
                         # Keep a sample OID per bucket_id for potential mtime lookup
                         if bucket_id not in self.data_oid_sample:
                             self.data_oid_sample[bucket_id] = oid
@@ -558,63 +636,61 @@ class OrphanDetector:
                 active_id = self.entrypoints.get(ep_name)
                 if active_id and bucket_id != active_id:
                     # entrypoint exists but points to different bucket_id - stale instance
-                    reshard_status = self._get_instance_reshard_status(bucket_id, ep_name)
+                    reshard_status = self._get_instance_reshard_status(
+                        bucket_id, ep_name
+                    )
                     if reshard_status is None:
                         # Can't read instance - skip safely
-                        skipped_instances.append(
-                            {
-                                "type": "skipped_stale_instance",
-                                "bucket_name": ep_name,
-                                "bucket_id": bucket_id,
-                                "active_bucket_id": active_id,
-                                "oid": info["oid"],
-                                "pool": self.zone.meta_pool,
-                                "namespace": "root",
-                                "tenant": info["tenant"],
-                                "reason": "could not read instance metadata to verify reshard status",
-                            }
-                        )
+                        skipped_instances.append({
+                            "type": "skipped_stale_instance",
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "active_bucket_id": active_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                            "reason": "could not read instance metadata to verify reshard status",
+                        })
                         continue
 
                     # Ceph: cls_rgw_reshard_status
                     # 0=NOT_RESHARDING, 1=IN_PROGRESS, 2=DONE, 3=IN_LOGRECORD
                     if reshard_status == 1:  # IN_PROGRESS
-                        skipped_instances.append(
-                            {
-                                "type": "skipped_stale_instance",
-                                "bucket_name": ep_name,
-                                "bucket_id": bucket_id,
-                                "active_bucket_id": active_id,
-                                "oid": info["oid"],
-                                "pool": self.zone.meta_pool,
-                                "namespace": "root",
-                                "tenant": info["tenant"],
-                                "reason": "reshard is IN_PROGRESS - deleting now would corrupt the bucket",
-                            }
-                        )
+                        skipped_instances.append({
+                            "type": "skipped_stale_instance",
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "active_bucket_id": active_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                            "reason": "reshard is IN_PROGRESS - deleting now would corrupt the bucket",
+                        })
                         continue
 
                     if reshard_status == 3:  # IN_LOGRECORD
-                        skipped_instances.append(
-                            {
-                                "type": "skipped_stale_instance",
-                                "bucket_name": ep_name,
-                                "bucket_id": bucket_id,
-                                "active_bucket_id": active_id,
-                                "oid": info["oid"],
-                                "pool": self.zone.meta_pool,
-                                "namespace": "root",
-                                "tenant": info["tenant"],
-                                "reason": "reshard is IN_LOGRECORD - background sync may still need this instance",
-                            }
-                        )
+                        skipped_instances.append({
+                            "type": "skipped_stale_instance",
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "active_bucket_id": active_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                            "reason": "reshard is IN_LOGRECORD - background sync may still need this instance",
+                        })
                         continue
 
                     if reshard_status == 0:  # NOT_RESHARDING
                         # Default state for buckets. Old instances may be abandoned
                         # after delete/recreate cycles (e.g. S3 replication changes).
                         # Safe to delete if entrypoint no longer references this bucket_id.
-                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                        in_period, skip_reason = self._is_oid_in_time_period(
+                            self.zone.meta_pool, "root", info["oid"]
+                        )
                         if not in_period:
                             skipped_instances.append({
                                 "type": "skipped_stale_instance",
@@ -641,7 +717,9 @@ class OrphanDetector:
 
                     if reshard_status == 2:  # DONE
                         # Reshard completed - instance is safe to flag as stale
-                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                        in_period, skip_reason = self._is_oid_in_time_period(
+                            self.zone.meta_pool, "root", info["oid"]
+                        )
                         if not in_period:
                             skipped_instances.append({
                                 "type": "skipped_stale_instance",
@@ -652,22 +730,21 @@ class OrphanDetector:
                                 "pool": self.zone.meta_pool,
                                 "namespace": "root",
                                 "tenant": info["tenant"],
-                                "reason": skip_reason or "outside specified time period",
+                                "reason": skip_reason
+                                or "outside specified time period",
                             })
                             continue
-                        stale_instances.append(
-                            {
-                                "type": "stale_instance",
-                                "bucket_name": ep_name,
-                                "bucket_id": bucket_id,
-                                "active_bucket_id": active_id,
-                                "oid": info["oid"],
-                                "pool": self.zone.meta_pool,
-                                "namespace": "root",
-                                "tenant": info["tenant"],
-                                "reason": f"entrypoint exists but points to different bucket_id ({active_id}). Reshard status: DONE.",
-                            }
-                        )
+                        stale_instances.append({
+                            "type": "stale_instance",
+                            "bucket_name": ep_name,
+                            "bucket_id": bucket_id,
+                            "active_bucket_id": active_id,
+                            "oid": info["oid"],
+                            "pool": self.zone.meta_pool,
+                            "namespace": "root",
+                            "tenant": info["tenant"],
+                            "reason": f"entrypoint exists but points to different bucket_id ({active_id}). Reshard status: DONE.",
+                        })
             else:
                 is_safe, reason = self._is_safe_to_remove(info)
                 if not is_safe:
@@ -683,7 +760,9 @@ class OrphanDetector:
                     }
                     skipped_instances.append(entry)
                 else:
-                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", info["oid"])
+                    in_period, skip_reason = self._is_oid_in_time_period(
+                        self.zone.meta_pool, "root", info["oid"]
+                    )
                     if not in_period:
                         entry = {
                             "type": "skipped_instance",
@@ -747,7 +826,9 @@ class OrphanDetector:
             if ep not in self.meta_entrypoints:
                 bucket_id = self.entrypoints.get(ep)
                 if not bucket_id or bucket_id not in self.rados_instances:
-                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.meta_pool, "root", ep)
+                    in_period, skip_reason = self._is_oid_in_time_period(
+                        self.zone.meta_pool, "root", ep
+                    )
                     if not in_period:
                         skipped_instances.append({
                             "type": "skipped_entrypoint",
@@ -758,16 +839,14 @@ class OrphanDetector:
                             "reason": skip_reason or "outside specified time period",
                         })
                         continue
-                    orphan_entrypoints.append(
-                        {
-                            "type": "orphan_entrypoint",
-                            "bucket_name": ep,
-                            "oid": ep,
-                            "pool": self.zone.meta_pool,
-                            "namespace": "root",
-                            "reason": "entrypoint object exists but no instance metadata found",
-                        }
-                    )
+                    orphan_entrypoints.append({
+                        "type": "orphan_entrypoint",
+                        "bucket_name": ep,
+                        "oid": ep,
+                        "pool": self.zone.meta_pool,
+                        "namespace": "root",
+                        "reason": "entrypoint object exists but no instance metadata found",
+                    })
 
         # Index objects without known instance
         for bucket_id, oids in self.index_objects.items():
@@ -776,7 +855,9 @@ class OrphanDetector:
                 and bucket_id not in self.rados_instances
             ):
                 for oid in oids:
-                    in_period, skip_reason = self._is_oid_in_time_period(self.zone.index_pool, "", oid)
+                    in_period, skip_reason = self._is_oid_in_time_period(
+                        self.zone.index_pool, "", oid
+                    )
                     if not in_period:
                         skipped_instances.append({
                             "type": "skipped_index",
@@ -787,16 +868,14 @@ class OrphanDetector:
                             "reason": skip_reason or "outside specified time period",
                         })
                         continue
-                    orphan_index.append(
-                        {
-                            "type": "orphan_index",
-                            "bucket_id": bucket_id,
-                            "oid": oid,
-                            "pool": self.zone.index_pool,
-                            "namespace": "",
-                            "reason": "index object exists but no bucket instance metadata found",
-                        }
-                    )
+                    orphan_index.append({
+                        "type": "orphan_index",
+                        "bucket_id": bucket_id,
+                        "oid": oid,
+                        "pool": self.zone.index_pool,
+                        "namespace": "",
+                        "reason": "index object exists but no bucket instance metadata found",
+                    })
 
         # Data objects without known bucket instance
         if self.scan_data_pool:
@@ -804,7 +883,9 @@ class OrphanDetector:
                 if bucket_id not in self.active_bucket_ids:
                     sample_oid = self.data_oid_sample.get(bucket_id)
                     if sample_oid:
-                        in_period, skip_reason = self._is_oid_in_time_period(self.zone.data_pool, "", sample_oid)
+                        in_period, skip_reason = self._is_oid_in_time_period(
+                            self.zone.data_pool, "", sample_oid
+                        )
                         if not in_period:
                             skipped_instances.append({
                                 "type": "skipped_data",
@@ -812,7 +893,8 @@ class OrphanDetector:
                                 "object_count": count,
                                 "pool": self.zone.data_pool,
                                 "namespace": "",
-                                "reason": skip_reason or "outside specified time period",
+                                "reason": skip_reason
+                                or "outside specified time period",
                             })
                             continue
                     orphan_data[bucket_id] = {
@@ -836,8 +918,12 @@ class OrphanDetector:
                 "scan_data_pool": self.scan_data_pool,
                 "detect_stale": True,
                 "time_period": {
-                    "start_period_utc": self.start_period.isoformat() if self.start_period else None,
-                    "end_period_utc": self.end_period.isoformat() if self.end_period else None,
+                    "start_period_utc": self.start_period.isoformat()
+                    if self.start_period
+                    else None,
+                    "end_period_utc": self.end_period.isoformat()
+                    if self.end_period
+                    else None,
                 },
             },
             "orphans": {
@@ -885,7 +971,9 @@ class OrphanCleaner:
         self.failed = []
 
     def _run(self, cmd: List[str]) -> Tuple[int, str, str]:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if cmd and cmd[0] == "radosgw-admin":
+            cmd = cmd + RGW_EXTRA_ARGS
+        proc = _subprocess_run(cmd)
         return proc.returncode, proc.stdout, proc.stderr
 
     def _rados_ls_streaming(self, pool: str, namespace: str = ""):
@@ -894,7 +982,7 @@ class OrphanCleaner:
             if namespace
             else ["rados", "-p", pool, "ls"],
             stdout=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
         )
         try:
             for line in proc.stdout:
@@ -931,12 +1019,22 @@ class OrphanCleaner:
             self.failed.append(item)
             return False
 
+    def _rm_object(self, pool: str, oid: str) -> Tuple[int, str]:
+        """Remove a single RADOS object; returns (rc, stderr)."""
+        proc = _subprocess_run(["rados", "-p", pool, "rm", oid])
+        return proc.returncode, proc.stderr
+
     def stream_remove_by_prefix(
-        self, bucket_ids: Set[str], pool: str, dry_run: bool = True
+        self,
+        bucket_ids: Set[str],
+        pool: str,
+        dry_run: bool = True,
+        parallel: int = 1,
     ) -> Dict[str, Tuple[int, int]]:
         """Remove all data objects matching any bucket_id prefix in a single pass.
 
         Streams the pool once, avoiding O(n²) repeated full scans.
+        When parallel > 1, removals run in a bounded thread pool.
         Returns {bucket_id: (removed_count, failed_count)}.
         """
         results: Dict[str, Tuple[int, int]] = {bid: (0, 0) for bid in bucket_ids}
@@ -944,31 +1042,66 @@ class OrphanCleaner:
 
         print(f"# Streaming data pool {pool} for cleanup...", file=sys.stderr)
 
+        def report_progress():
+            total_removed = sum(r[0] for r in results.values())
+            total_failed = sum(r[1] for r in results.values())
+            print(
+                f"#   Progress: {total_matched} objects matched, "
+                f"removed: {total_removed}, failed: {total_failed}",
+                file=sys.stderr,
+            )
+
+        def flush(pending):
+            for fut in as_completed(pending):
+                bucket_id, rc = fut.result()
+                removed, failed = results[bucket_id]
+                if rc == 0:
+                    results[bucket_id] = (removed + 1, failed)
+                else:
+                    results[bucket_id] = (removed, failed + 1)
+            pending.clear()
+
+        def _rm_tracked(oid: str, bucket_id: str):
+            rc, _ = self._rm_object(pool, oid)
+            return bucket_id, rc
+
         try:
-            for oid in self._rados_ls_streaming(pool):
-                for bucket_id in bucket_ids:
-                    if oid.startswith(bucket_id + "_"):
-                        total_matched += 1
-                        if dry_run:
-                            removed, failed = results[bucket_id]
-                            results[bucket_id] = (removed + 1, failed)
-                        else:
-                            rc, _, err = self._run(["rados", "-p", pool, "rm", oid])
-                            removed, failed = results[bucket_id]
-                            if rc == 0:
+            if parallel > 1 and not dry_run:
+                pending: List = []
+                with ThreadPoolExecutor(max_workers=parallel) as executor:
+                    for oid in self._rados_ls_streaming(pool):
+                        for bucket_id in bucket_ids:
+                            if oid.startswith(bucket_id + "_"):
+                                total_matched += 1
+                                pending.append(
+                                    executor.submit(_rm_tracked, oid, bucket_id)
+                                )
+                                if len(pending) >= parallel * 4:
+                                    flush(pending)
+                                if total_matched % 10000 == 0:
+                                    report_progress()
+                                break
+                    if pending:
+                        flush(pending)
+            else:
+                # Serial path (also used for dry-run accounting)
+                for oid in self._rados_ls_streaming(pool):
+                    for bucket_id in bucket_ids:
+                        if oid.startswith(bucket_id + "_"):
+                            total_matched += 1
+                            if dry_run:
+                                removed, failed = results[bucket_id]
                                 results[bucket_id] = (removed + 1, failed)
                             else:
-                                results[bucket_id] = (removed, failed + 1)
-                        # Report progress periodically
-                        if total_matched % 10000 == 0:
-                            total_removed = sum(r[0] for r in results.values())
-                            total_failed = sum(r[1] for r in results.values())
-                            print(
-                                f"#   Progress: {total_matched} objects matched, "
-                                f"removed: {total_removed}, failed: {total_failed}",
-                                file=sys.stderr,
-                            )
-                        break
+                                rc, _ = self._rm_object(pool, oid)
+                                removed, failed = results[bucket_id]
+                                if rc == 0:
+                                    results[bucket_id] = (removed + 1, failed)
+                                else:
+                                    results[bucket_id] = (removed, failed + 1)
+                            if total_matched % 10000 == 0:
+                                report_progress()
+                            break
         except RuntimeError as e:
             print(json.dumps({"error": str(e)}))
             sys.exit(1)
@@ -994,30 +1127,30 @@ def _parse_sync_log_oid(oid: str) -> Tuple[Optional[str], Optional[str]]:
     """
     # Strip the prefix
     if oid.startswith("bucket.sync-status."):
-        rest = oid[len("bucket.sync-status."):]
+        rest = oid[len("bucket.sync-status.") :]
     elif oid.startswith("bucket.full-sync-status."):
-        rest = oid[len("bucket.full-sync-status."):]
+        rest = oid[len("bucket.full-sync-status.") :]
     else:
         return None, None
 
     # Bucket ID is reliably identifiable: UUID-like component with two numeric suffixes
-    match = re.search(r'([a-f0-9-]+\.\d+\.\d+)', rest)
+    match = re.search(r"([a-f0-9-]+\.\d+\.\d+)", rest)
     if not match:
         return None, None
     bucket_id = match.group(1)
 
     # Everything before the bucket_id contains the bucket name
-    prefix = rest[:match.start()]
+    prefix = rest[: match.start()]
     # Drop the zone_id portion (everything up to first ':')
-    first_colon = prefix.find(':')
+    first_colon = prefix.find(":")
     if first_colon == -1:
         return None, None
-    bucket_context = prefix[first_colon + 1:]
+    bucket_context = prefix[first_colon + 1 :]
     # Trim leading/trailing ':' artifacts from empty tenant (::)
-    bucket_context = bucket_context.lstrip(':').rstrip(':')
+    bucket_context = bucket_context.lstrip(":").rstrip(":")
     # Extract bucket name after tenant separator
-    if '/' in bucket_context:
-        bucket_name = bucket_context.split('/', 1)[1]
+    if "/" in bucket_context:
+        bucket_name = bucket_context.split("/", 1)[1]
     else:
         bucket_name = bucket_context
     return bucket_name, bucket_id
@@ -1043,7 +1176,7 @@ def check_sync_logs(
         proc = subprocess.Popen(
             ["rados", "-p", zone.log_pool, "ls"],
             stdout=subprocess.PIPE,
-            text=True,
+            universal_newlines=True,
         )
         for line in proc.stdout:
             line = line.strip()
@@ -1066,13 +1199,16 @@ def check_sync_logs(
                 if not has_instance and not has_entrypoint:
                     is_stale = True
 
-            elif line.startswith(("bucket.sync-source-hints.", "bucket.sync-target-hints.")):
+            elif line.startswith((
+                "bucket.sync-source-hints.",
+                "bucket.sync-target-hints.",
+            )):
                 # Format: bucket.sync-source-hints.<tenant>/<bucket>
                 # or bucket.sync-source-hints.<bucket> (no tenant)
                 if line.startswith("bucket.sync-source-hints."):
-                    rest = line[len("bucket.sync-source-hints."):]
+                    rest = line[len("bucket.sync-source-hints.") :]
                 else:
-                    rest = line[len("bucket.sync-target-hints."):]
+                    rest = line[len("bucket.sync-target-hints.") :]
 
                 if "/" in rest:
                     tenant, bucket_name = rest.split("/", 1)
@@ -1090,18 +1226,18 @@ def check_sync_logs(
                 continue
 
             stale_oids.append(line)
-            item: Dict[str, str] = {"oid": line, "pool": zone.log_pool, "status": "detected"}
+            item: Dict[str, str] = {
+                "oid": line,
+                "pool": zone.log_pool,
+                "status": "detected",
+            }
             if bucket_id:
                 item["bucket_id"] = bucket_id
             if bucket_name:
                 item["bucket_name"] = bucket_name
 
             if delete:
-                proc = subprocess.run(
-                    ["rados", "-p", zone.log_pool, "rm", line],
-                    capture_output=True,
-                    text=True,
-                )
+                proc = _subprocess_run(["rados", "-p", zone.log_pool, "rm", line])
                 rc = proc.returncode
                 err = proc.stderr
                 if rc == 0:
@@ -1116,9 +1252,69 @@ def check_sync_logs(
         proc.wait()
     except Exception as e:
         # Log pool access failure is non-fatal
-        print(f"# WARNING: Could not scan log pool {zone.log_pool}: {e}", file=sys.stderr)
+        print(
+            f"# WARNING: Could not scan log pool {zone.log_pool}: {e}", file=sys.stderr
+        )
 
     return len(stale_oids), stale_oids, detected
+
+
+def resolve_bucket_id(bucket_name: str) -> Optional[str]:
+    """Resolve a bucket name ('tenant/name' or 'name') to its active bucket_id."""
+    proc = _subprocess_run(
+        ["radosgw-admin", "bucket", "stats", "--bucket", bucket_name] + RGW_EXTRA_ARGS
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data.get("id")
+
+
+def bucket_index_usage(bucket_ref: str, use_bucket_id: bool = False) -> Optional[Dict]:
+    """Return the calculated bucket index usage from 'bucket check' (None if it fails).
+
+    The calculated_header is derived from the index entries themselves: an empty
+    or all-zero usage means no live object references data in the data pool.
+    Non-empty 'invalid_multipart_entries' adds a sentinel key, since those may
+    still reference data objects.
+    """
+    flag = "--bucket-id" if use_bucket_id else "--bucket"
+    proc = _subprocess_run(
+        ["radosgw-admin", "bucket", "check", flag, bucket_ref] + RGW_EXTRA_ARGS
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    result = data.get("check_result", {})
+    usage = dict(result.get("calculated_header", {}).get("usage", {}))
+    if result.get("invalid_multipart_entries"):
+        usage["__invalid_multipart_entries"] = len(result["invalid_multipart_entries"])
+    return usage
+
+
+def usage_is_empty(usage: Optional[Dict]) -> bool:
+    """True when a bucket index has no live entries.
+
+    None (check failed / unreadable) is treated as NOT empty for safety.
+    """
+    if usage is None:
+        return False
+    if not usage:
+        return True
+    for key, stats in usage.items():
+        if key == "__invalid_multipart_entries":
+            return False
+        if isinstance(stats, dict) and (
+            stats.get("num_objects", 0) > 0 or stats.get("size", 0) > 0
+        ):
+            return False
+    return True
 
 
 def print_report(report: Dict):
@@ -1126,91 +1322,144 @@ def print_report(report: Dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="RGW Complete Orphan Cleaner"
-    )
+    parser = argparse.ArgumentParser(description="RGW Complete Orphan Cleaner")
     parser.add_argument(
-        "--delete",
-        action="store_true",
-        default=False,
-        help="Enable deletion mode"
+        "--delete", action="store_true", default=False, help="Enable deletion mode"
     )
     parser.add_argument(
         "--yes-i-really-mean-it",
         action="store_true",
         default=False,
-        help="Skip interactive confirmation (like Ceph admin commands)"
+        help="Skip interactive confirmation (like Ceph admin commands)",
     )
-    parser.add_argument(
-        "--output",
-        default="-",
-        help="Output file path"
-    )
+    parser.add_argument("--output", default="-", help="Output file path")
     parser.add_argument(
         "--data-pool",
         action="store_true",
         default=False,
-        help="Scan data pool for orphan objects"
+        help="Scan data pool for orphan objects",
     )
     parser.add_argument(
         "--verify-active",
         action="store_true",
         default=False,
-        help="Verify bucket stats before flagging as orphan"
+        help="Verify bucket stats before flagging as orphan",
     )
     parser.add_argument(
         "--inactive-tenants-only",
         action="store_true",
         default=False,
-        help="Only remove instances for tenants with no active users"
+        help="Only remove instances for tenants with no active users",
     )
     parser.add_argument(
         "--delete-stale",
         action="store_true",
         default=False,
-        help="DANGEROUS: Allow deletion of stale bucket instances from resharding. Only delete instances with reshard_status=DONE that are outside any active reshard window. (use with --yes-i-really-mean-it)"
+        help="DANGEROUS: Allow deletion of stale bucket instances from resharding. Only delete instances with reshard_status=DONE that are outside any active reshard window. (use with --yes-i-really-mean-it)",
     )
     parser.add_argument(
         "--include-transient",
         action="store_true",
         default=False,
-        help="Include transient instances (BUCKET_DELETED bit set in flags: 64/66/98) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up."
+        help="Include transient instances (BUCKET_DELETED bit set in flags: 64/66/98) in cleanup. By default these are reported but skipped as BucketTrimInstanceCR will clean them up.",
     )
     parser.add_argument(
         "--start-period-utc",
         type=str,
         default=None,
-        help="Only include orphans/objects modified on or after this UTC time (ISO 8601, e.g. 2024-01-01T00:00:00Z)"
+        help="Only include orphans/objects modified on or after this UTC time (ISO 8601, e.g. 2024-01-01T00:00:00Z)",
     )
     parser.add_argument(
         "--end-period-utc",
         type=str,
         default=None,
-        help="Only include orphans/objects modified up to this UTC time (ISO 8601, e.g. 2024-12-31T23:59:59Z)"
+        help="Only include orphans/objects modified up to this UTC time (ISO 8601, e.g. 2024-12-31T23:59:59Z)",
     )
     parser.add_argument(
         "--include-sync-logs",
         action="store_true",
         default=False,
-        help="When used with --delete, also remove stale bucket.sync-status entries from the zone log pool. Detection is always performed automatically."
+        help="When used with --delete, also remove stale bucket.sync-status entries from the zone log pool. Detection is always performed automatically.",
+    )
+    parser.add_argument(
+        "--bucket-id",
+        action="append",
+        default=[],
+        metavar="BUCKET_ID",
+        help="Force data cleanup scoped to this bucket_id (<zone_id>.<num>.<num>, "
+        "repeatable). Enables --data-pool. For buckets known to RGW, the bucket "
+        "index is verified empty first unless --force.",
+    )
+    parser.add_argument(
+        "--bucket",
+        action="append",
+        default=[],
+        metavar="TENANT/NAME",
+        help="Force data cleanup scoped to this bucket name (repeatable); resolved "
+        "to its active bucket_id via 'bucket stats --bucket'. Enables --data-pool.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="DANGEROUS: skip the empty-index safety gate for --bucket-id/--bucket "
+        "scoped data cleanup (use with --yes-i-really-mean-it)",
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Parallel 'rados rm' workers during data pool cleanup (default 1)",
+    )
+    parser.add_argument(
+        "--rgw-extra-args",
+        type=str,
+        default="",
+        help="Extra flags passed to every radosgw-admin call, e.g. "
+        '"--rgw-realm=ik-s3-nvme --rgw-zonegroup=ch-gva-nvme --rgw-zone=ch-gva-nvme-d2"',
     )
     args = parser.parse_args()
+
+    global RGW_EXTRA_ARGS
+    RGW_EXTRA_ARGS = shlex.split(args.rgw_extra_args or "")
+
+    # --- Validate and resolve bucket-scoped cleanup request (fail fast) ---
+    forced_ids: Set[str] = set()
+    resolved_from_name: Dict[str, str] = {}
+    for name in args.bucket:
+        bid = resolve_bucket_id(name)
+        if not bid:
+            print(
+                json.dumps({
+                    "error": f"cannot resolve bucket '{name}' "
+                    f"(tried 'bucket stats --bucket {name}')"
+                })
+            )
+            sys.exit(1)
+        resolved_from_name[name] = bid
+        forced_ids.add(bid)
+    for bid in args.bucket_id:
+        if not re.match(r"^[a-f0-9-]+\.\d+\.\d+$", bid):
+            print(
+                json.dumps({
+                    "error": f"invalid --bucket-id '{bid}' "
+                    "(expected <zone_id>.<num>.<num>)"
+                })
+            )
+            sys.exit(1)
+        forced_ids.add(bid)
 
     # Parse time period arguments
     start_period: Optional[datetime] = None
     end_period: Optional[datetime] = None
     if args.start_period_utc:
-        ts = args.start_period_utc.replace("Z", "+00:00")
-        start_period = datetime.fromisoformat(ts)
-        if start_period.tzinfo is None:
-            start_period = start_period.replace(tzinfo=timezone.utc)
+        start_period = _parse_iso8601(args.start_period_utc)
     if args.end_period_utc:
-        ts = args.end_period_utc.replace("Z", "+00:00")
-        end_period = datetime.fromisoformat(ts)
-        if end_period.tzinfo is None:
-            end_period = end_period.replace(tzinfo=timezone.utc)
+        end_period = _parse_iso8601(args.end_period_utc)
     if start_period and end_period and start_period > end_period:
-        print(json.dumps({"error": "--start-period-utc must be before --end-period-utc"}))
+        print(
+            json.dumps({"error": "--start-period-utc must be before --end-period-utc"})
+        )
         sys.exit(1)
 
     try:
@@ -1219,11 +1468,13 @@ def main():
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
 
+    scan_data_pool = args.data_pool or bool(forced_ids)
+
     detector = OrphanDetector(
         zone,
         verify_active=args.verify_active,
         inactive_tenants_only=args.inactive_tenants_only,
-        scan_data_pool=args.data_pool,
+        scan_data_pool=scan_data_pool,
         start_period=start_period,
         end_period=end_period,
     )
@@ -1233,10 +1484,15 @@ def main():
     # --- Sync log check: always detect ---
     # Build sets of known (live) bucket names and instance IDs from metadata
     known_instances: Set[str] = set(detector.instances.keys())
-    known_entrypoints: Set[str] = set(detector.meta_entrypoints) | set(detector.rados_entrypoints)
+    known_entrypoints: Set[str] = set(detector.meta_entrypoints) | set(
+        detector.rados_entrypoints
+    )
 
     sync_count, sync_oids, sync_detected = check_sync_logs(
-        zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=False
+        zone,
+        known_instances=known_instances,
+        known_entrypoints=known_entrypoints,
+        delete=False,
     )
     report["sync_logs"] = {
         "log_pool": zone.log_pool,
@@ -1252,8 +1508,74 @@ def main():
     total_data = report["summary"]["total_data_orphans"]
     total_transient = report["summary"]["total_transient_instances"]
 
+    # --- Safety gate for bucket-scoped cleanup: index must be empty ---
+    gate_results: Dict[str, Dict] = {}
+    gate_blocked = False
+    for bid in sorted(forced_ids):
+        if bid not in detector.active_bucket_ids:
+            gate_results[bid] = {
+                "known_bucket": False,
+                "index_empty": True,
+                "data_object_count": detector.data_objects.get(bid, 0),
+                "note": "no bucket instance metadata - standard orphan semantics",
+            }
+            continue
+        ep_name = detector.instances.get(bid)
+        if not ep_name:
+            info = detector.rados_instances.get(bid)
+            if info:
+                ep_name = info["ep_name"]
+        usage = None
+        if ep_name:
+            usage = bucket_index_usage(ep_name)
+            if usage is None:
+                usage = bucket_index_usage(bid, use_bucket_id=True)
+        else:
+            usage = bucket_index_usage(bid, use_bucket_id=True)
+        usage_public = dict(usage) if usage is not None else None
+        invalid_mp = (
+            usage_public.pop("__invalid_multipart_entries", 0) if usage_public else 0
+        )
+        is_empty = usage_is_empty(usage)
+        gate_results[bid] = {
+            "known_bucket": True,
+            "ep_name": ep_name,
+            "index_usage": usage_public,
+            "invalid_multipart_entries": invalid_mp,
+            "index_empty": is_empty,
+            "data_object_count": detector.data_objects.get(bid, 0),
+        }
+        if not is_empty:
+            gate_results[bid]["blocked"] = not args.force
+            if not args.force:
+                gate_results[bid]["reason"] = (
+                    "bucket index is NOT empty - refusing to delete its data "
+                    "objects (use --force to override)"
+                )
+                gate_blocked = True
+
+    forced_total_objects = sum(
+        g.get("data_object_count", 0) for g in gate_results.values()
+    )
+    report["forced_data_cleanup"] = {
+        "requested_bucket_ids": sorted(args.bucket_id),
+        "requested_buckets": args.bucket,
+        "resolved": resolved_from_name,
+        "bucket_ids": sorted(forced_ids),
+        "total_objects": forced_total_objects,
+        "gates": gate_results,
+        "blocked": gate_blocked,
+        "results": {},
+    }
+
     # --- Deletion mode ---
-    anything_to_clean = total > 0 or total_data > 0 or total_transient > 0 or sync_count > 0
+    anything_to_clean = (
+        total > 0
+        or total_data > 0
+        or total_transient > 0
+        or sync_count > 0
+        or bool(forced_ids)
+    )
     if args.delete and anything_to_clean:
         if not args.yes_i_really_mean_it:
             transient_msg = ""
@@ -1262,8 +1584,16 @@ def main():
             sync_msg = ""
             if sync_count > 0 and args.include_sync_logs:
                 sync_msg = f" + {sync_count} sync log entries"
+            forced_msg = ""
+            if forced_ids:
+                forced_msg = (
+                    f" + {len(forced_ids)} forced bucket ID data set(s) "
+                    f"(~{forced_total_objects} objects)"
+                )
+            total_data_objs = report["summary"]["total_data_orphan_objects"]
             print(
-                f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s){sync_msg}. Proceed? [y/N] ",
+                f"# Found {total} metadata orphan(s){transient_msg} + {total_data} data orphan bucket(s) "
+                f"(~{total_data_objs} objects){sync_msg}{forced_msg}. Proceed? [y/N] ",
                 end="",
                 file=sys.stderr,
             )
@@ -1281,6 +1611,24 @@ def main():
                     with open(args.output, "w") as f:
                         f.write(json_report + "\n")
                 sys.exit(1)
+
+        if gate_blocked:
+            print(
+                "# ERROR: forced data cleanup blocked by the empty-index safety "
+                "gate (use --force to override).",
+                file=sys.stderr,
+            )
+            report["cleanup"] = {
+                "cleanup_completed": False,
+                "error": "blocked by empty-index safety gate (use --force to override)",
+            }
+            json_report = json.dumps(report, indent=2)
+            if args.output == "-":
+                print(json_report)
+            else:
+                with open(args.output, "w") as f:
+                    f.write(json_report + "\n")
+            sys.exit(1)
 
         cleaner = OrphanCleaner(zone)
         all_orphans = (
@@ -1309,7 +1657,7 @@ def main():
             )
             all_orphans += report["orphans"]["stale_instances"]
 
-        if not all_orphans and total_data == 0:
+        if not all_orphans and total_data == 0 and not forced_ids:
             if total_transient > 0 and not args.include_transient:
                 print(
                     f"# No true orphans to remove ({total_transient} transient instance(s) skipped, "
@@ -1323,7 +1671,10 @@ def main():
             for item in all_orphans:
                 ok = cleaner.remove(item, dry_run=False)
                 status = "removed" if ok else "FAILED"
-                print(f"# {status}: {item.get('type', item.get('bucket_id', 'unknown'))} {item['oid']}", file=sys.stderr)
+                print(
+                    f"# {status}: {item.get('type', item.get('bucket_id', 'unknown'))} {item['oid']}",
+                    file=sys.stderr,
+                )
 
             # Clean data orphans
             if args.data_pool and total_data > 0:
@@ -1331,41 +1682,85 @@ def main():
                 total_buckets = len(data_orphans)
                 total_objects = report["summary"]["total_data_orphan_objects"]
 
-                print(f"# Starting data cleanup: {total_buckets} bucket IDs, ~{total_objects} total objects", file=sys.stderr)
+                print(
+                    f"# Starting data cleanup: {total_buckets} bucket IDs, ~{total_objects} total objects",
+                    file=sys.stderr,
+                )
 
                 # Collect all bucket IDs and do a single streaming pass
                 bucket_ids = set(d["bucket_id"] for d in data_orphans)
                 pool = data_orphans[0]["pool"] if data_orphans else zone.data_pool
-                results = cleaner.stream_remove_by_prefix(bucket_ids, pool, dry_run=False)
+                results = cleaner.stream_remove_by_prefix(
+                    bucket_ids, pool, dry_run=False, parallel=args.parallel
+                )
 
                 for data_entry in data_orphans:
                     bucket_id = data_entry["bucket_id"]
                     removed, failed = results.get(bucket_id, (0, 0))
                     data_entry["removed_count"] = removed
                     data_entry["failed_count"] = failed
-                    print(f"# Completed {bucket_id}: {removed} removed, {failed} failed", file=sys.stderr)
+                    print(
+                        f"# Completed {bucket_id}: {removed} removed, {failed} failed",
+                        file=sys.stderr,
+                    )
+
+            # Forced, bucket-scoped data cleanup (--bucket-id / --bucket)
+            if forced_ids:
+                if not zone.data_pool:
+                    print(
+                        json.dumps({"error": "data pool unknown - cannot run forced cleanup"})
+                    )
+                    sys.exit(1)
+                print(
+                    f"# Forced cleanup of {len(forced_ids)} bucket ID(s), "
+                    f"~{forced_total_objects} objects from {zone.data_pool}",
+                    file=sys.stderr,
+                )
+                results = cleaner.stream_remove_by_prefix(
+                    forced_ids, zone.data_pool, dry_run=False, parallel=args.parallel
+                )
+                for bid in sorted(forced_ids):
+                    removed, failed = results.get(bid, (0, 0))
+                    print(
+                        f"# Completed {bid}: {removed} removed, {failed} failed",
+                        file=sys.stderr,
+                    )
+                report["forced_data_cleanup"]["results"] = {
+                    bid: {"removed": r[0], "failed": r[1]}
+                    for bid, r in sorted(results.items())
+                }
 
         # Clean stale sync logs (after user confirmed deletion)
         if args.include_sync_logs and sync_count > 0:
-            print(f"# Deleting {sync_count} stale sync log entries from {zone.log_pool}...", file=sys.stderr)
+            print(
+                f"# Deleting {sync_count} stale sync log entries from {zone.log_pool}...",
+                file=sys.stderr,
+            )
             _, _, sync_removed = check_sync_logs(
-                zone, known_instances=known_instances, known_entrypoints=known_entrypoints, delete=True
+                zone,
+                known_instances=known_instances,
+                known_entrypoints=known_entrypoints,
+                delete=True,
             )
             report["sync_logs"]["deleted"] = True
-            report["sync_logs"]["removed_count"] = len([r for r in sync_removed if r.get("status") == "removed"])
-            report["sync_logs"]["failed_count"] = len([r for r in sync_removed if r.get("status") == "failed"])
+            report["sync_logs"]["removed_count"] = len([
+                r for r in sync_removed if r.get("status") == "removed"
+            ])
+            report["sync_logs"]["failed_count"] = len([
+                r for r in sync_removed if r.get("status") == "failed"
+            ])
             report["sync_logs"]["entries"] = sync_removed
-            print(f"# Sync logs: {report['sync_logs']['removed_count']} removed, {report['sync_logs']['failed_count']} failed", file=sys.stderr)
+            print(
+                f"# Sync logs: {report['sync_logs']['removed_count']} removed, {report['sync_logs']['failed_count']} failed",
+                file=sys.stderr,
+            )
 
         # Attach cleanup summary to the report
         report["cleanup"] = {
             "cleanup_completed": True,
             "metadata_removed": len(cleaner.removed),
             "metadata_failed": len(cleaner.failed),
-            "details": {
-                "removed": cleaner.removed,
-                "failed": cleaner.failed
-            }
+            "details": {"removed": cleaner.removed, "failed": cleaner.failed},
         }
 
     # --- JSON summary is printed first ---
@@ -1396,6 +1791,21 @@ def main():
             f"# Found {total_data} data bucket ID(s) with ~{total_data_objs} orphan objects. Use --delete --data-pool to clean up.",
             file=sys.stderr,
         )
+
+    # --- Forced bucket-scoped cleanup summary ---
+    if "forced_data_cleanup" in report:
+        fdc = report["forced_data_cleanup"]
+        if fdc.get("blocked"):
+            print(
+                "# Forced bucket-scoped data cleanup is BLOCKED by the empty-index safety gate (use --force to override).",
+                file=sys.stderr,
+            )
+        elif fdc.get("bucket_ids") and not args.delete:
+            print(
+                f"# Forced bucket-scoped cleanup ready for {len(fdc['bucket_ids'])} bucket ID(s) "
+                f"(~{fdc.get('total_objects', 0)} objects). Use --delete to clean up.",
+                file=sys.stderr,
+            )
 
     # --- Sync log summary (always detected) ---
     if "sync_logs" in report:
